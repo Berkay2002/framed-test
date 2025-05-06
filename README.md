@@ -18,7 +18,7 @@ This project is a real-time, interactive social deduction game designed specific
   The user interface is specifically optimized for desktop use, focusing on rich interactions and a layout tailored to mouse and keyboard inputs.
 
 ## Technological Specification
-
+hej
 ### Client Framework
 - **Framework:** Next.js with React and TypeScript  
   - **Rationale:** Next.js offers a robust yet lightweight framework that supports both server-side rendering and dynamic client-side interactivity. This makes it ideal for building interactive, real-time applications.
