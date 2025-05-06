@@ -4,8 +4,5 @@
       "path": "/api/scheduler",
       "schedule": "0 * * * *"
     }
-  ],
-  "github": {
-    "silent": true
-  }
-} 
+  ]
+}
