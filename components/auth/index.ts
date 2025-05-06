@@ -1,0 +1,1 @@
+export { default as UserAuthButton } from '@/components/auth/user-auth-button'; 
