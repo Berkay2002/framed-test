@@ -100,4 +100,133 @@ export async function GET(request: NextRequest) {
       error: "Server error processing round metadata"
     }, { status: 500 });
   }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    // Get authenticated user
+    const supabase = await createClient();
+    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    
+    if (authError || !user) {
+      return NextResponse.json({
+        success: false,
+        error: "Authentication required"
+      }, { status: 401 });
+    }
+
+    // Parse request body
+    const body = await request.json();
+    const { roomId, action, roundId } = body;
+
+    if (!roomId || !action) {
+      return NextResponse.json({
+        success: false,
+        error: "Missing required parameters"
+      }, { status: 400 });
+    }
+
+    console.log(`Round meta action: ${action} for room ${roomId}`);
+
+    // Verify user is host of the room
+    const { data: room, error: roomError } = await supabase
+      .from("game_rooms")
+      .select("host_id, current_round")
+      .eq("id", roomId)
+      .single();
+
+    if (roomError || !room) {
+      return NextResponse.json({
+        success: false,
+        error: "Room not found"
+      }, { status: 404 });
+    }
+
+    if (room.host_id !== user.id) {
+      return NextResponse.json({
+        success: false,
+        error: "Only the host can control round phases"
+      }, { status: 403 });
+    }
+
+    // Handle different actions
+    switch (action) {
+      case "skip_timer":
+        // Skip the captioning timer and move to voting phase
+        console.log(`Host skipping timer for room ${roomId}`);
+        
+        // Update the round deadline to now (effectively ending the captioning phase)
+        if (roundId) {
+          const { error: roundUpdateError } = await supabase
+            .from("game_rounds")
+            .update({
+              deadline_at: new Date().toISOString()
+            })
+            .eq("id", roundId);
+
+          if (roundUpdateError) {
+            console.error("Error updating round deadline:", roundUpdateError);
+            return NextResponse.json({
+              success: false,
+              error: "Failed to update round deadline"
+            }, { status: 500 });
+          }
+        }
+
+        // Send a broadcast message to notify all players
+        const skipTimerChannel = supabase.channel(`room-${roomId}-skip-timer`);
+        await skipTimerChannel.send({
+          type: 'broadcast',
+          event: 'host_action',
+          payload: {
+            action: 'skip_timer',
+            message: 'Host skipped the timer! Moving to voting phase.',
+            timestamp: new Date().toISOString(),
+            round_number: room.current_round
+          }
+        });
+
+        return NextResponse.json({
+          success: true,
+          action: "skip_timer",
+          message: "Timer skipped successfully"
+        });
+
+      case "skip_voting":
+        // Skip the voting phase and move to results
+        console.log(`Host skipping voting for room ${roomId}`);
+        
+        // Send a broadcast message to notify all players
+        const skipVotingChannel = supabase.channel(`room-${roomId}-skip-voting`);
+        await skipVotingChannel.send({
+          type: 'broadcast',
+          event: 'host_action',
+          payload: {
+            action: 'skip_voting',
+            message: 'Host skipped voting! Moving to results.',
+            timestamp: new Date().toISOString(),
+            round_number: room.current_round
+          }
+        });
+
+        return NextResponse.json({
+          success: true,
+          action: "skip_voting",
+          message: "Voting skipped successfully"
+        });
+
+      default:
+        return NextResponse.json({
+          success: false,
+          error: "Unknown action"
+        }, { status: 400 });
+    }
+
+  } catch (error) {
+    console.error("Error in round-meta API:", error);
+    return NextResponse.json({
+      success: false,
+      error: "Internal server error"
+    }, { status: 500 });
+  }
 } 

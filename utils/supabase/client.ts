@@ -12,6 +12,12 @@ export const createClient = () =>
         autoRefreshToken: true,
         detectSessionInUrl: true,
         flowType: 'pkce'
+      },
+      // Configure realtime subscriptions
+      realtime: {
+        params: {
+          eventsPerSecond: 10 // Increase from default 1
+        }
       }
     }
   );

@@ -38,7 +38,6 @@ export async function POST(request: NextRequest) {
     let supabase;
     try {
       supabase = createAdminClient();
-      console.log("Created admin Supabase client");
     } catch (clientError) {
       console.error("Failed to create Supabase client:", clientError);
       return NextResponse.json({

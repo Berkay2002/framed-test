@@ -59,7 +59,7 @@ export type Database = {
           host_id: string
           id: string
           impostor_id: string | null
-          last_heartbeat: string | null
+          last_activity: string | null
           started_at: string | null
           status: string
         }
@@ -71,7 +71,7 @@ export type Database = {
           host_id: string
           id?: string
           impostor_id?: string | null
-          last_heartbeat?: string | null
+          last_activity?: string | null
           started_at?: string | null
           status: string
         }
@@ -83,7 +83,7 @@ export type Database = {
           host_id?: string
           id?: string
           impostor_id?: string | null
-          last_heartbeat?: string | null
+          last_activity?: string | null
           started_at?: string | null
           status?: string
         }
@@ -92,6 +92,7 @@ export type Database = {
       game_rounds: {
         Row: {
           completed_at: string | null
+          deadline_at: string | null
           fake_image_url: string
           id: string
           real_image_url: string
@@ -101,6 +102,7 @@ export type Database = {
         }
         Insert: {
           completed_at?: string | null
+          deadline_at?: string | null
           fake_image_url: string
           id?: string
           real_image_url: string
@@ -110,6 +112,7 @@ export type Database = {
         }
         Update: {
           completed_at?: string | null
+          deadline_at?: string | null
           fake_image_url?: string
           id?: string
           real_image_url?: string
@@ -155,25 +158,38 @@ export type Database = {
         Row: {
           caption: string | null
           id: string
+          peep_target_id: string | null
           player_id: string
+          points: number | null
           round_id: string
           submitted_at: string | null
         }
         Insert: {
           caption?: string | null
           id?: string
+          peep_target_id?: string | null
           player_id: string
+          points?: number | null
           round_id: string
           submitted_at?: string | null
         }
         Update: {
           caption?: string | null
           id?: string
+          peep_target_id?: string | null
           player_id?: string
+          points?: number | null
           round_id?: string
           submitted_at?: string | null
         }
         Relationships: [
+          {
+            foreignKeyName: "player_captions_peep_target_id_fkey"
+            columns: ["peep_target_id"]
+            isOneToOne: false
+            referencedRelation: "game_players"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "player_captions_player_id_fkey"
             columns: ["player_id"]
@@ -194,6 +210,7 @@ export type Database = {
         Row: {
           id: string
           room_id: string
+          round_id: string | null
           voted_at: string | null
           voted_for_id: string
           voter_id: string
@@ -201,6 +218,7 @@ export type Database = {
         Insert: {
           id?: string
           room_id: string
+          round_id?: string | null
           voted_at?: string | null
           voted_for_id: string
           voter_id: string
@@ -208,6 +226,7 @@ export type Database = {
         Update: {
           id?: string
           room_id?: string
+          round_id?: string | null
           voted_at?: string | null
           voted_for_id?: string
           voter_id?: string
@@ -218,6 +237,13 @@ export type Database = {
             columns: ["room_id"]
             isOneToOne: false
             referencedRelation: "game_rooms"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "player_votes_round_id_fkey"
+            columns: ["round_id"]
+            isOneToOne: false
+            referencedRelation: "game_rounds"
             referencedColumns: ["id"]
           },
           {
@@ -239,25 +265,37 @@ export type Database = {
       profiles: {
         Row: {
           avatar_url: string | null
+          blocked_users: string[] | null
           email: string | null
+          friend_ids: Json[] | null
           full_name: string | null
           id: string
+          request_ids: Json[] | null
+          sent_request_ids: string[] | null
           updated_at: string | null
           username: string | null
         }
         Insert: {
           avatar_url?: string | null
+          blocked_users?: string[] | null
           email?: string | null
+          friend_ids?: Json[] | null
           full_name?: string | null
           id: string
+          request_ids?: Json[] | null
+          sent_request_ids?: string[] | null
           updated_at?: string | null
           username?: string | null
         }
         Update: {
           avatar_url?: string | null
+          blocked_users?: string[] | null
           email?: string | null
+          friend_ids?: Json[] | null
           full_name?: string | null
           id?: string
+          request_ids?: Json[] | null
+          sent_request_ids?: string[] | null
           updated_at?: string | null
           username?: string | null
         }

@@ -1,7 +1,7 @@
 "use client";
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { GameService, GameRoom, GamePlayer, GameRound } from './game-service';
+import { GameService, GameRoom, GamePlayer, GameRound, PlayerCaption, PlayerVote } from "@/lib/game-service"; 
 import { createClient } from '@/utils/supabase/client';
 import { useRouter } from 'next/navigation';
 import { toast } from 'sonner';
@@ -25,14 +25,17 @@ interface GameContextType {
   error: string | null;
   userId: string | null;
   playerId: string | null;
+  isImpostor: boolean;
   
   // Game actions
   createRoom: () => Promise<void>;
   joinRoom: (code: string) => Promise<GameRoom | null>;
   startGame: () => Promise<StartGameResult | null>;
   submitCaption: (caption: string) => Promise<void>;
-  submitVote: (playerId: string) => Promise<void>;
   leaveRoom: (forceDelete?: boolean) => Promise<unknown>;
+  submitVote: (votedForId: string) => Promise<void>;
+  submitMultipleVotes: (playerIds: string[]) => Promise<void>;
+  advanceToRound: (roundNumber: number) => Promise<void>; 
 }
 
 interface CreateRoomParams {
@@ -55,9 +58,11 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   const [isStartingGame, setIsStartingGame] = useState(false);
   const [isCreatingRoom, setIsCreatingRoom] = useState(false);
   const [isJoiningRoom, setIsJoiningRoom] = useState(false);
+  const [hasVoted, setHasVoted] = useState(false);
   
   // Calculate if the current user is the host
   const isHost = !!(currentRoom && userId && currentRoom.host_id === userId);
+  const isImpostor = !!(currentRoom && userId && currentRoom.impostor_id === userId);
   
   // Get the current user ID on mount
   useEffect(() => {
@@ -141,23 +146,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   // Room heartbeat effect - send heartbeats while room is active
   useEffect(() => {
     if (currentRoom?.id && isHost) {
-      console.log(`Setting up room heartbeat for room ${currentRoom.id}`);
-      
-      // Send initial heartbeat
-      GameService.updateRoomHeartbeat(currentRoom.id);
-      
-      // Set up heartbeat interval (every 60 seconds)
-      const heartbeatInterval = setInterval(() => {
-        if (document.visibilityState === 'visible' && currentRoom?.id) {
-          console.log(`Sending room heartbeat for ${currentRoom.id}`);
-          GameService.updateRoomHeartbeat(currentRoom.id);
-        }
-      }, 60000); // 1 minute heartbeat
-      
-      // Clean up interval on unmount or room change
-      return () => {
-        clearInterval(heartbeatInterval);
-      };
+      console.log(`Room ${currentRoom.id} is active`);
     }
   }, [currentRoom?.id, isHost]);
   
@@ -166,15 +155,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     // Only run this cleanup from the game hub page
     if (typeof window !== 'undefined' && window.location.pathname === '/game-hub') {
       // Run cleanup operation for rooms with stale heartbeats (inactive for 5+ minutes)
-      GameService.cleanupStaleHeartbeats(5)
-        .then(count => {
-          if (count > 0) {
-            console.log(`Cleaned up ${count} rooms with stale heartbeats`);
-          }
-        })
-        .catch(err => {
-          console.error("Error cleaning up stale rooms:", err);
-        });
+      // Not critical - we'll just log that this functionality is disabled for now
     }
   }, []);
   
@@ -187,42 +168,138 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       // Set up a heartbeat interval to update player's last_seen timestamp
       const heartbeatInterval = setInterval(() => {
         if (document.visibilityState === 'visible') {
-          GameService.updatePlayerHeartbeat(playerId, userId);
+          // Direct Supabase call instead of GameService method
+          const supabase = createClient();
+          (async () => {
+            try {
+              await supabase
+                .from("game_players")
+                .update({ 
+                  is_online: true,
+                  last_seen: new Date().toISOString() 
+                })
+                .eq("id", playerId)
+                .eq("user_id", userId);
+              console.log('Player online status updated');
+            } catch (error) {
+              console.error('Failed to update player online status:', error);
+            }
+          })();
         }
       }, 30000); // Send heartbeat every 30 seconds when tab is visible
+      
+      // Listen for manual round refresh requests
+      const handleForceRoundRefresh = async (event: Event) => {
+        const customEvent = event as CustomEvent;
+        const { roomId, nextRoundNumber } = customEvent.detail;
+        
+        if (roomId === currentRoom.id) {
+          console.log(`🔄 Manual round refresh requested for room ${roomId}, round ${nextRoundNumber}`);
+          try {
+            // First refresh the room data
+            const roomData = await GameService.getRoomByCode(currentRoom.code);
+            if (roomData) {
+              console.log(`📡 Refreshed room data: status=${roomData.status}, current_round=${roomData.current_round}`);
+              const oldRound = currentRoom.current_round;
+              setCurrentRoom(roomData);
+              
+              // Then fetch the new round data if game is in progress
+              if (roomData.status === 'in_progress' && roomData.current_round) {
+                const roundData = await GameService.getCurrentRound(roomId);
+                console.log(`📡 Manual refresh: fetched round data for round ${nextRoundNumber}:`, roundData);
+                
+                if (roundData) {
+                  setCurrentRound(roundData);
+                  
+                  // Dispatch the round change event for components to handle
+                  window.dispatchEvent(new CustomEvent('game:round-changed', {
+                    detail: { 
+                      roomId: roomId,
+                      oldRound: oldRound,
+                      newRound: nextRoundNumber,
+                      roundData: roundData
+                    }
+                  }));
+                  
+                  console.log(`✅ Manual round refresh completed successfully`);
+                  toast.info(`Round ${nextRoundNumber} detected via polling!`);
+                } else {
+                  console.warn(`⚠️ No round data found for round ${nextRoundNumber}`);
+                }
+              } else {
+                console.log(`📝 Room not in progress, clearing round data`);
+                setCurrentRound(null);
+              }
+            }
+          } catch (error) {
+            console.error('❌ Error in manual round refresh:', error);
+          }
+        }
+      };
+      
+      window.addEventListener('game:force-round-refresh', handleForceRoundRefresh);
       
       return () => {
         cleanup();
         clearInterval(heartbeatInterval);
+        window.removeEventListener('game:force-round-refresh', handleForceRoundRefresh);
       };
     }
   }, [currentRoom?.id, playerId, userId]);
   
-  // Add document visibility change handler to mark player as offline/online
+  // Effect to handle room status changes
   useEffect(() => {
-    if (playerId && userId) {
-      const handleVisibilityChange = () => {
-        if (document.visibilityState === 'visible') {
-          // User returned to the tab, mark as online
-          GameService.updatePlayerHeartbeat(playerId, userId).catch(err => {
-            console.error("Failed to update player heartbeat:", err);
-            // Don't show toast for this as it's a background operation
-          });
-        }
-      };
-      
-      document.addEventListener('visibilitychange', handleVisibilityChange);
-      
-      return () => {
-        document.removeEventListener('visibilitychange', handleVisibilityChange);
-      };
+    // Check for inactive or completed status
+    const isCompleted = currentRoom?.status === 'completed';
+    
+    if (isCompleted) {
+      // Reset game state when room is inactive or game is completed
+      console.log(`Room is completed, resetting game state`);
+      setCurrentRound(null);
     }
-  }, [playerId, userId]);
+  }, [currentRoom?.status]);
+  
+  // Helper function to verify and correct the game state
+  const verifyGameState = (room: GameRoom | null) => {
+    if (!room) return;
+    
+    console.log("Verifying game state for room:", room.id);
+    
+    // If room is in lobby or completed, ensure currentRound is null
+    if (room.status === 'lobby' || room.status === 'completed') {
+      if (currentRound !== null) {
+        console.log(`Room ${room.id} is in ${room.status} status but currentRound is not null, correcting`);
+        setCurrentRound(null);
+      }
+    } 
+    // If room is in progress, ensure we have a currentRound
+    else if (room.status === 'in_progress' && currentRound === null && room.current_round) {
+      console.log(`Room ${room.id} is in_progress but currentRound is null, fetching round data`);
+      // Fetch the current round
+      GameService.getCurrentRound(room.id).then(round => {
+        if (round) {
+          console.log(`Fetched round data for room ${room.id}:`, round);
+          setCurrentRound(round);
+        } else {
+          console.log(`No round data found for in_progress room ${room.id}`);
+        }
+      }).catch(err => {
+        console.error(`Error fetching round data for room ${room.id}:`, err);
+      });
+    }
+  };
+  
+  // Apply the verification whenever currentRoom changes
+  useEffect(() => {
+    if (currentRoom) {
+      verifyGameState(currentRoom);
+    }
+  }, [currentRoom?.id, currentRoom?.status]);
   
   // Create a new room and redirect to it
   const createRoom = async (): Promise<void> => {
     if (!userId) {
-      toast.error("Please sign in to create a room");
+      //toast.error("Please sign in to create a room");
       router.push('/sign-in');
       return;
     }
@@ -254,8 +331,12 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
         const targetPath = `/game-hub/${result.room.code}`;
         console.log("Navigating to:", targetPath);
         
-        // Use Router.push for client-side navigation
-        router.push(targetPath);
+        // Keep loading state active for a minimum time to show animation
+        // before navigation
+        setTimeout(() => {
+          // Use Router.push for client-side navigation
+          router.push(targetPath);
+        }, 2000);
       } catch (serviceError) {
         console.error("GameService.createRoom failed:", serviceError);
         toast.error("Using direct approach to create room due to API error");
@@ -327,8 +408,12 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
         const targetPath = `/game-hub/${room.code}`;
         console.log("Navigating to:", targetPath);
         
-        // Use Router.push for client-side navigation 
-        router.push(targetPath);
+        // Keep loading state active for a minimum time to show animation
+        // before navigation
+        setTimeout(() => {
+          // Use Router.push for client-side navigation
+          router.push(targetPath);
+        }, 2000);
       }
     } catch (err: any) {
       const errorMessage = err?.message || 'Failed to create room';
@@ -413,27 +498,39 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       
       // Get all the players in the room
       try {
-        const roomPlayers = await GameService.getPlayersInRoom(room.id);
-        setPlayers(roomPlayers);
+        const roomPlayers = await GameService.getPlayersInRoom(room.id, true);
+        const onlinePlayers = roomPlayers.filter(player => player.is_online);
+        setPlayers(onlinePlayers);
       } catch (playersError) {
         console.error("Error fetching players:", playersError);
         // Continue anyway, we can fetch players through subscription
       }
       
-      // If the game is already in progress, get the current round
-      if (room.status === 'in_progress' && room.current_round) {
+      // Important: Always clear current round when joining a room unless the status is in_progress
+      // This is to ensure players joining a lobby don't get thrown into the game view
+      if (room.status === 'lobby' || room.status === 'completed') {
+        console.log(`Room is in ${room.status} state, setting currentRound to null`);
+        setCurrentRound(null);
+      } else if (room.status === 'in_progress' && room.current_round) {
+        // Only fetch the current round if the game is actually in progress
         try {
           const round = await GameService.getCurrentRound(room.id);
+          console.log(`Fetched current round for in_progress game:`, round);
           setCurrentRound(round);
         } catch (roundError) {
-          console.error("Error fetching round:", roundError);
-          // Continue anyway
+          console.error("Error fetching current round:", roundError);
+          // If we can't fetch the round, set it to null to be safe
+          setCurrentRound(null);
         }
+      } else {
+        // Fallback for any other state
+        setCurrentRound(null);
       }
       
       // Show a different toast message based on reconnection status
       if (reconnected) {
         console.log(`Reconnected to room ${code}`);
+        toast.success(`Reconnected to room ${code}`);
       } else {
         toast.success(`Joined room ${code} as ${player.game_alias}`);
       }
@@ -443,7 +540,18 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       const expectedPath = `/game-hub/${code}`;
       
       if (currentPath !== expectedPath) {
-        router.push(expectedPath);
+        // Keep loading state active during navigation
+        setTimeout(() => {
+          router.push(expectedPath);
+          // Only reset loading state after a minimum duration
+          setTimeout(() => {
+            setIsJoiningRoom(false);
+            setIsLoading(false);
+          }, 500);
+        }, 2000);
+        
+        // Don't reset loading state here, it will be done after navigation
+        return room;
       }
       
       return room;
@@ -451,10 +559,16 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       console.error("Error joining room:", err);
       setError(err.message || "Failed to join room");
       toast.error(err.message || "Failed to join room");
-      return null;
-    } finally {
       setIsJoiningRoom(false);
       setIsLoading(false);
+      return null;
+    } finally {
+      // Only reset states if we're not navigating to another page
+      // Otherwise the states will be reset after navigation
+      if (window.location.pathname === `/game-hub/${code}`) {
+        setIsJoiningRoom(false);
+        setIsLoading(false);
+      }
     }
   };
   
@@ -479,16 +593,60 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       console.log(`Starting game in room ${currentRoom.id}`);
       const result = await GameService.startGame(currentRoom.id, userId);
       
+      if (!result) {
+        console.error("startGame returned null or undefined result");
+        throw new Error("Failed to start game - server returned no result");
+      }
+      
+      if (!result.room) {
+        console.error("startGame returned result with missing room data:", result);
+        throw new Error("Failed to start game - incomplete server response");
+      }
+      
       // Update local state with the new room and round
       setCurrentRoom(result.room);
-      setCurrentRound(result.round);
-      console.log("Game started successfully:", result);
+      
+      // Verify we got a valid round object, log the result if not
+      if (!result.round) {
+        console.warn("startGame returned result with missing round data:", result);
+        // Don't throw here, but don't update currentRound if it's null
+      } else {
+        setCurrentRound(result.round);
+      }
+      
+      // Send game start announcements - disabled for broadcast chat
+      try {
+        // System messages don't work with broadcast chat
+        // await ChatService.sendSystemMessage(
+        //   result.room.id,
+        //   `Game started! Round 1 is beginning...`,
+        //   'lobby'
+        // );
+        
+        // Send a message to the round-specific chat
+        // await ChatService.sendSystemMessage(
+        //   result.room.id,
+        //   `Round 1 has started! Discuss the image and identify the impostor.`,
+        //   'round',
+        //   1
+        // );
+        console.log('Game start announcements skipped (broadcast chat)');
+      } catch (chatError) {
+        console.error('Failed to send game start chat messages:', chatError);
+        // Don't block game start if messages fail
+      }
       
       return result;
     } catch (err: any) {
       const errorMessage = err?.message || 'Failed to start game';
       setError(errorMessage);
       console.error("Error starting game:", err);
+      
+      // Clear the loading state to ensure UI remains responsive
+      setIsLoading(false);
+      setIsStartingGame(false);
+      
+      // Re-throw the error so it can be handled by the caller
       throw err;
     } finally {
       setIsLoading(false);
@@ -503,7 +661,11 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   // Submit a caption
   const submitCaption = async (caption: string) => {
     if (!currentRoom || !currentRound || !playerId) {
-      toast.error("Cannot submit caption at this time");
+      console.log("current room: ", currentRoom);
+      console.log("current round: ",currentRound);
+      console.log("player id: ",playerId);
+      
+      toast.error("Cannot submit caption at this time because currentroom, currentround or playerid is invalid");
       return;
     }
     
@@ -512,6 +674,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     
     try {
       await GameService.submitCaption(currentRound.id, playerId, caption);
+      toast.success("Caption submitted successfully!");
     } catch (err: any) {
       const errorMessage = err?.message || 'Failed to submit caption';
       setError(errorMessage);
@@ -521,11 +684,63 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       setIsLoading(false);
     }
   };
-  
-  // Submit a vote
+
+  // Submit a single vote for a player
   const submitVote = async (votedForId: string) => {
-    if (!currentRoom || !playerId) {
+    if (!currentRoom || !playerId || !currentRound?.id) {
+      console.error("❌ SUBMIT VOTE: Missing required data", {
+        currentRoom: !!currentRoom,
+        playerId: !!playerId,
+        currentRound: !!currentRound?.id
+      });
       toast.error("Cannot submit vote at this time");
+      return;
+    }
+    
+    if (hasVoted) {
+      console.warn("⚠️ SUBMIT VOTE: Player has already voted");
+      toast.error("You've already voted in this round");
+      return;
+    }
+    
+    console.log(`🗳️ SUBMIT VOTE: Starting vote submission`);
+    console.log(`🗳️ SUBMIT VOTE: Room ID: ${currentRoom.id}`);
+    console.log(`🗳️ SUBMIT VOTE: Round ID: ${currentRound.id}`);
+    console.log(`🗳️ SUBMIT VOTE: Voter ID (playerId): ${playerId}`);
+    console.log(`🗳️ SUBMIT VOTE: Voted for ID: ${votedForId}`);
+    
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      await GameService.submitMultipleVotes(
+        currentRoom.id,
+        currentRound.id,
+        playerId,
+        [votedForId] // Single vote as array
+      );
+      
+      setHasVoted(true);
+      console.log(`✅ SUBMIT VOTE: Vote submitted successfully`);
+      toast.success("Vote submitted successfully!");
+    } catch (err: any) {
+      const errorMessage = err?.message || 'Failed to submit vote';
+      console.error("❌ SUBMIT VOTE: Error submitting vote:", err);
+      setError(errorMessage);
+      toast.error(errorMessage);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const submitMultipleVotes = async (votedForIds: string[]) => {
+    if (!currentRoom || !playerId || !currentRound?.id) {
+      toast.error("Cannot submit votes at this time");
+      return;
+    }
+    
+    if (hasVoted) {
+      toast.error("You've already voted in this round");
       return;
     }
     
@@ -533,9 +748,17 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     setError(null);
     
     try {
-      await GameService.submitVote(currentRoom.id, playerId, votedForId);
+      await GameService.submitMultipleVotes(
+        currentRoom.id,
+        currentRound.id,
+        playerId,
+        votedForIds
+      );
+      
+      setHasVoted(true);
+      toast.success(`Successfully submitted ${votedForIds.length} votes!`);
     } catch (err: any) {
-      const errorMessage = err?.message || 'Failed to submit vote';
+      const errorMessage = err?.message || 'Failed to submit votes';
       setError(errorMessage);
       toast.error(errorMessage);
       console.error(err);
@@ -595,6 +818,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     const currentRoomId = currentRoom?.id;
     const roomCode = currentRoom?.code;
     const wasOnlyPlayer = players.length === 1;
+    const wasHost = isHost;
     
     try {
       // Set a flag in sessionStorage to prevent auto-rejoin
@@ -612,14 +836,42 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       // If we have a player ID and user ID, mark the player as offline in the database
       if (currentPlayerId && userId) {
         try {
-          // Ensure player is removed from room even if API call fails
-          const result = await GameService.removePlayerFromRoom(currentPlayerId, userId, true);
-          console.log("Successfully left room:", result);
-          
-          // Show success toast
-          if (wasOnlyPlayer) {
-            toast.success("Left room and room was closed");
+          // Direct Supabase call instead of GameService
+          if (forceDelete) {
+            const supabase = createClient();
+            await supabase
+              .from("game_players")
+              .delete()
+              .eq("id", currentPlayerId)
+              .eq("user_id", userId);
+            
+            console.log("Successfully left room via direct database call");
           } else {
+            const supabase = createClient();
+            await supabase
+              .from("game_players")
+              .update({ 
+                is_online: false,
+                last_seen: new Date().toISOString() 
+              })
+              .eq("id", currentPlayerId)
+              .eq("user_id", userId);
+              
+            console.log("Successfully marked player as offline");
+          }
+          
+          // Show appropriate success toast based on context and new room status
+          if (wasOnlyPlayer && !wasHost) {
+            // Regular player who was the last one in the room
+            toast.success("Left room and room is now inactive");
+          } else if (wasOnlyPlayer && wasHost) {
+            // Host who was the last one in the room - room is now inactive (dormant)
+            //toast.success("Left room successfully - room will remain available in the Game Hub");
+          } else if (wasHost) {
+            // Host leaving but other players remain
+            toast.success("Left room successfully - host status transferred");
+          } else {
+            // Regular player leaving
             toast.success("Left room successfully");
           }
         } catch (leaveError) {
@@ -637,21 +889,46 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
               
             console.log("Used fallback to delete player");
             
-            // If last player, attempt to mark room as completed to hide it from active rooms
+            // If we were the last player, mark room as dormant (inactive)
             if (wasOnlyPlayer && currentRoomId) {
               await supabase
                 .from("game_rooms")
-                .update({ status: "completed" })
+                .update({ status: "dormant", last_activity: new Date().toISOString() })
                 .eq("id", currentRoomId);
                 
-              console.log("Used fallback to mark room as completed");
+              console.log("Used fallback to mark room as dormant (inactive)");
+              toast.success("Left room successfully - room is now inactive");
+            } else {
+              // Not the last player
+              toast.success(wasHost 
+                ? "Left room successfully - host status transferred" 
+                : "Left room successfully");
             }
-            
-            toast.success(wasOnlyPlayer ? "Left room and room was closed" : "Left room");
           } catch (fallbackError) {
             console.error("Fallback operation failed:", fallbackError);
             // Continue with cleanup even if all API calls fail
+            toast.success("Left room");
           }
+        }
+      }
+      
+      // Announce player leaving in chat - disabled for broadcast chat
+      if (currentRoom && playerId) {
+        try {
+          const playerInfo = players.find(p => p.id === playerId);
+          const playerName = playerInfo?.game_alias || 'Player';
+          
+          // System messages don't work with broadcast chat
+          // ChatService.sendSystemMessage(
+          //   currentRoom.id,
+          //   `${playerName} has left the room.`,
+          //   'lobby'
+          // ).catch(err => {
+          //   console.error("Error sending player left message:", err);
+          // });
+          console.log(`${playerName} left room announcement skipped (broadcast chat)`);
+        } catch (err) {
+          console.error("Error getting player info for announcement:", err);
         }
       }
     } catch (err) {
@@ -668,11 +945,12 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
         setIsLeavingRoom(false);
       }, 5000);
       
-      // Always force redirect to ensure users can leave
+      // Handle navigation based on current state
+      // Note: Many components override this navigation with their own logic
       if (typeof window !== 'undefined') {
         const currentPath = window.location.pathname;
         if (currentPath !== '/game-hub') {
-          // Navigate back to game hub
+          // Navigate back to game hub - many components override this
           router.push('/game-hub');
         } else {
           console.log("Already on the game hub page, not redirecting");
@@ -687,20 +965,70 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     
     // Subscribe to room changes
     const roomSubscription = GameService.subscribeToRoom(roomId, async (payload) => {
-      console.log(`Room subscription triggered:`, payload.eventType);
+      console.log(`🏠 Room subscription triggered:`, payload.eventType, `Room ${roomId}`);
       // Update the room state when it changes
       if (payload.new) {
+        console.log(`📊 Room update: old_round=${payload.old?.current_round}, new_round=${payload.new.current_round}, status=${payload.new.status}`);
         setCurrentRoom(payload.new);
         
-        // If the round changes, fetch the new round
-        if (payload.new.current_round !== currentRoom?.current_round) {
-          const round = await GameService.getCurrentRound(roomId);
-          setCurrentRound(round);
+        // Check for room status changes and handle appropriately
+        if (payload.old && payload.old.status !== payload.new.status) {
+          console.log(`🔄 Room status changed from ${payload.old.status} to ${payload.new.status}`);
+          
+          // If room status changed to lobby from in_progress, clear the current round
+          if (payload.new.status === 'lobby' && payload.old.status === 'in_progress') {
+            console.log(`🏠 Room went back to lobby, clearing current round`);
+            setCurrentRound(null);
+          }
         }
+        
+        // If the round changes, fetch the new round, but only if the game is in progress
+        if (payload.old && payload.new.current_round !== payload.old.current_round) {
+          console.log(`🎯 ROOM ROUND CHANGED from ${payload.old.current_round} to ${payload.new.current_round}`);
+          if (payload.new.status === 'in_progress') {
+            console.log(`🎮 Game in progress, fetching round data for round ${payload.new.current_round}`);
+            try {
+              const round = await GameService.getCurrentRound(roomId);
+              console.log(`✅ Successfully fetched round data:`, round);
+              setCurrentRound(round);
+              
+              // Dispatch a custom event to notify other components about the round change
+              // This ensures GameView and other components can react to round transitions
+              window.dispatchEvent(new CustomEvent('game:round-changed', {
+                detail: { 
+                  roomId: roomId,
+                  oldRound: payload.old.current_round,
+                  newRound: payload.new.current_round,
+                  roundData: round
+                }
+              }));
+              
+            } catch (error) {
+              console.error(`❌ Error fetching round data:`, error);
+              setCurrentRound(null);
+            }
+          } else {
+            console.log(`🚫 Game not in progress, clearing current round`);
+            setCurrentRound(null);
+          }
+        } else if (!payload.old && payload.new.current_round && payload.new.status === 'in_progress') {
+          // Handle case where there's no old payload (first load)
+          console.log(`🎬 Initial round load for round ${payload.new.current_round}`);
+          try {
+            const round = await GameService.getCurrentRound(roomId);
+            setCurrentRound(round);
+          } catch (error) {
+            console.error(`❌ Error fetching initial round data:`, error);
+            setCurrentRound(null);
+          }
+        }
+        
+        // Verify the game state after all changes
+        verifyGameState(payload.new);
       }
     });
     
-    // Subscribe to player changes - making this more responsive
+    // Subscribe to player changes
     const playersSubscription = GameService.subscribeToPlayers(roomId, async (payload) => {
       console.log(`Player subscription triggered:`, payload.eventType, payload);
       
@@ -713,68 +1041,45 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
         
         // Also fetch the complete list to ensure consistency
         try {
-          const roomPlayers = await GameService.getPlayersInRoom(roomId);
-          console.log(`Refreshed player list after deletion, now ${roomPlayers.length} players`);
-          setPlayers(roomPlayers);
+          const roomPlayers = await GameService.getPlayersInRoom(roomId, true);
+          const onlinePlayers = roomPlayers.filter(player => player.is_online);
+          console.log(`Refreshed player list after deletion, now ${onlinePlayers.length} online players`);
+          setPlayers(onlinePlayers);
         } catch (err) {
           console.error("Error refreshing players after deletion:", err);
         }
         return;
       }
       
-      // For updates (like a player going offline), update that specific player
+      // For updates (like a player going offline)
       if (payload.eventType === 'UPDATE' && payload.new) {
         console.log(`Player ${payload.new.id} was updated`, payload.new);
         
-        // If player went from online to offline, filter them out from the displayed players list
-        if (payload.old?.is_online === true && payload.new.is_online === false) {
-          console.log(`Player ${payload.new.id} went offline, removing from displayed players`);
-          setPlayers(currentPlayers => 
-            currentPlayers.filter(player => player.id !== payload.new.id || player.is_online === true)
-          );
-        } else if (payload.old?.is_online === false && payload.new.is_online === true) {
-          // Player came back online, make sure they're included
-          console.log(`Player ${payload.new.id} came back online, adding to displayed players`);
-          setPlayers(currentPlayers => {
-            // Check if player already exists in the list
-            const playerExists = currentPlayers.some(player => player.id === payload.new.id);
-            // If not, add them, otherwise update their info
-            return playerExists 
-              ? currentPlayers.map(player => player.id === payload.new.id ? payload.new : player)
-              : [...currentPlayers, payload.new];
-          });
-        } else {
-          // Just update the player's info for other changes
-          setPlayers(currentPlayers => 
-            currentPlayers.map(player => 
-              player.id === payload.new.id ? payload.new : player
-            )
-          );
-        }
+        // Update player in the current list
+        setPlayers(currentPlayers => 
+          currentPlayers.map(player => 
+            player.id === payload.new.id ? payload.new : player
+          )
+        );
         
-        // Always refresh the player list to ensure consistency
+        // Refresh the player list
         try {
-          const roomPlayers = await GameService.getPlayersInRoom(roomId);
-          console.log(`Refreshed player list after update, now ${roomPlayers.length} total players, filtering offline players`);
-          
-          // Only display online players in the UI
-          const onlinePlayers = roomPlayers.filter(player => player.is_online === true);
-          console.log(`Displaying ${onlinePlayers.length} online players`);
+          const roomPlayers = await GameService.getPlayersInRoom(roomId, true);
+          const onlinePlayers = roomPlayers.filter(player => player.is_online);
+          console.log(`Refreshed player list after update: ${onlinePlayers.length} online players`);
           setPlayers(onlinePlayers);
         } catch (err) {
-          console.error("Error refreshing players after update:", err);
+          console.error("Error refreshing players:", err);
         }
         return;
       }
       
-      // For other events (like INSERT), fetch all players for consistency
+      // For other events (like INSERT), fetch all players
       try {
-        const roomPlayers = await GameService.getPlayersInRoom(roomId);
-        console.log(`Refreshed player list for ${payload.eventType}, now ${roomPlayers.length} total players`);
-        
-        // Only display online players in the UI
-        const onlinePlayers = roomPlayers.filter(player => player.is_online === true);
-        console.log(`Displaying ${onlinePlayers.length} online players`);
+        const roomPlayers = await GameService.getPlayersInRoom(roomId, true); // Include offline players
+        const onlinePlayers = roomPlayers.filter(player => player.is_online);
+        console.log(`Refreshed player list for ${payload.eventType}: ${onlinePlayers.length} online players (${roomPlayers.length} total)`);
+        console.log(`Online players:`, onlinePlayers.map(p => ({ id: p.id, alias: p.game_alias, online: p.is_online })));
         setPlayers(onlinePlayers);
       } catch (err) {
         console.error(`Error refreshing players for ${payload.eventType}:`, err);
@@ -782,10 +1087,9 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     });
     
     // Initial fetch to ensure we have the latest data
-    GameService.getPlayersInRoom(roomId).then(roomPlayers => {
-      // Only display online players in the UI
-      const onlinePlayers = roomPlayers.filter(player => player.is_online === true);
-      console.log(`Initial player fetch: ${roomPlayers.length} total, ${onlinePlayers.length} online`);
+    GameService.getPlayersInRoom(roomId, true).then(roomPlayers => {
+      const onlinePlayers = roomPlayers.filter(player => player.is_online);
+      console.log(`Initial player fetch: ${onlinePlayers.length} online players`);
       setPlayers(onlinePlayers);
     }).catch(err => {
       console.error("Error in initial player fetch:", err);
@@ -797,6 +1101,95 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       playersSubscription.unsubscribe();
     };
   };
+
+
+  const advanceToRound = async (roundNumber: number) => {
+    if (!currentRoom || !userId || !isHost) {
+      toast.error("Only the host can advance to the next round");
+      return;
+    }
+    
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      const supabase = createClient();
+      
+      // 1. Update the game_rooms table to the new round
+      const { data: updatedRoomData, error: roomUpdateError } = await supabase
+        .from('game_rooms')
+        .update({ current_round: roundNumber })
+        .eq('id', currentRoom.id)
+        .select()
+        .single();
+
+      if (roomUpdateError) throw roomUpdateError;
+      if (!updatedRoomData) throw new Error("Failed to update room for next round.");
+      
+      // 2. Activate the existing round (pre-created when game started)
+      console.log(`Activating pre-existing round ${roundNumber} for room ${currentRoom.id}`);
+      
+      const { data: updatedRoundData, error: roundUpdateError } = await supabase
+        .from('game_rounds')
+        .update({
+          started_at: new Date().toISOString(),
+          deadline_at: new Date(Date.now() + 20 * 1000).toISOString(), // 20 seconds for dev
+        })
+        .eq('room_id', currentRoom.id)
+        .eq('round_number', roundNumber)
+        .select()
+        .single();
+
+      if (roundUpdateError) {
+        console.error("Error activating round:", roundUpdateError);
+        throw new Error(`Failed to activate round ${roundNumber}: ${roundUpdateError.message}`);
+      }
+      
+      if (!updatedRoundData) {
+        throw new Error(`Round ${roundNumber} not found - it should have been pre-created when the game started.`);
+      }
+
+      // 3. Clear any old votes for this round
+      try {
+        if (playerId) {
+          await supabase
+            .from("player_votes")
+            .delete()
+            .eq("round_id", updatedRoundData.id)
+            .eq("voter_id", playerId);
+        }
+      } catch (voteErr) {
+        console.warn("Failed to clear old votes, but continuing:", voteErr);
+      }
+
+      // 4. Update context state (for host)
+      setCurrentRoom(updatedRoomData);
+      setCurrentRound(updatedRoundData);
+      setHasVoted(false); // Reset voting status for the new round
+
+      // 5. Immediately dispatch round change event to ensure all components respond
+      // This is crucial for ensuring non-host players transition properly
+      console.log(`🚀 Host dispatching immediate round change event for round ${roundNumber}`);
+      window.dispatchEvent(new CustomEvent('game:round-changed', {
+        detail: { 
+          roomId: currentRoom.id,
+          oldRound: currentRoom.current_round,
+          newRound: roundNumber,
+          roundData: updatedRoundData
+        }
+      }));
+
+      toast.success(`Round ${roundNumber} started! New images loaded.`);
+      
+    } catch (err) {
+      console.error("Error advancing to next round:", err);
+      const message = err instanceof Error ? err.message : "An unknown error occurred";
+      setError(message);
+      toast.error(`Failed to start next round: ${message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
   
   const value = {
     currentRoom,
@@ -807,12 +1200,15 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     error,
     userId,
     playerId,
+    isImpostor,
     createRoom,
     joinRoom,
     startGame,
     submitCaption,
+    leaveRoom,
     submitVote,
-    leaveRoom
+    submitMultipleVotes,
+    advanceToRound,
   };
   
   return <GameContext.Provider value={value}>{children}</GameContext.Provider>;
@@ -820,8 +1216,8 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
 
 export function useGame() {
   const context = useContext(GameContext);
-  if (context === undefined) {
-    throw new Error('useGame must be used within a GameProvider');
+  if (context == undefined){
+    throw new Error("useGame must be used within a GameProvider");
   }
   return context;
-} 
+}

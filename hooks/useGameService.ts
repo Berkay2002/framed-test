@@ -238,13 +238,10 @@ export function useGameService() {
         }
         
         const result = await response.json();
-        console.log('Game started successfully via API:', result);
         
         setCurrentRoom(result.room);
-        toast.success('Game started!');
         return result.room;
       } catch (apiError) {
-        console.error('API start game failed, using fallback:', apiError);
         
         // Update room status directly
         const { data: roomData, error: roomError } = await supabase
@@ -257,7 +254,6 @@ export function useGameService() {
         if (roomError) throw roomError;
         
         setCurrentRoom(roomData);
-        toast.success('Game started (client fallback)');
         return roomData;
       }
     } catch (error) {

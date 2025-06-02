@@ -5,12 +5,12 @@ export async function GET(request: NextRequest) {
   try {
     // Get URL parameters
     const searchParams = request.nextUrl.searchParams;
-    const key = searchParams.get('key'); //game room Id
+    const roomId = searchParams.get('key'); // game room Id
 
-    //console.log("this is the key", key);
+    console.log("round-image-url API called for room ID:", roomId);
     
     // Validate parameters
-    if (!key) {
+    if (!roomId) {
       return NextResponse.json({ 
         success: false, 
         error: "Missing key parameter" 
@@ -22,139 +22,108 @@ export async function GET(request: NextRequest) {
     const { data: { user }, error: authError } = await supabase.auth.getUser();
     
     if (authError || !user) {
+      console.error("Authentication error in round-image-url:", authError);
       return NextResponse.json({
         success: false,
         error: "Authentication required"
       }, { status: 401 });
     }
     
-    // Fetch the impostor id from current game
-    const {data: gameData, error: gameError} = await supabase
+    // 1. Get current game information
+    const { data: gameRoom, error: gameError } = await supabase
       .from('game_rooms')
-      .select('impostor_id')
-      .eq('id', key)
+      .select('impostor_id, current_round, status')
+      .eq('id', roomId)
       .single();
     
-    console.log("game data: ", gameData);
-      
-    // Check if fetch was successful
-    if(gameError || !gameData){
+    if (gameError || !gameRoom) {
+      console.error("Error fetching game room:", gameError);
       return NextResponse.json({
         success: false,
-        error: "Failed to fetch game data or game not found"
-      }, {status: 404});
+        error: "Game room not found"
+      }, { status: 404 });
+    }
+    
+    if (gameRoom.status !== 'in_progress' || !gameRoom.current_round) {
+      console.error("Game is not in progress or missing round number");
+      return NextResponse.json({
+        success: false,
+        error: "Game not in valid state for image"
+      }, { status: 400 });
+    }
+    
+    // Check if user is impostor
+    const isImpostor = user.id === gameRoom.impostor_id;
+    
+    // 2. Get the current round with image URLs (should already be populated from game start)
+    const { data: roundData, error: roundError } = await supabase
+      .from('game_rounds')
+      .select('id, real_image_url, fake_image_url')
+      .eq('room_id', roomId)
+      .eq('round_number', gameRoom.current_round)
+      .maybeSingle();
+    
+    if (roundError) {
+      console.error("Error fetching round data:", roundError);
+      return NextResponse.json({
+        success: false,
+        error: `Error fetching round: ${roundError.message}`
+      }, { status: 500 });
+    }
+    
+    if (!roundData) {
+      console.error("Round not found for room", roomId, "round", gameRoom.current_round);
+      return NextResponse.json({
+        success: false,
+        error: "Round not found"
+      }, { status: 404 });
     }
 
-    // Determine if the current user is the impostor in the current room
-    const isImpostor = user.id === gameData.impostor_id;
-
-    // Fetch all categories first
-    const { data: categories, error: categoryError } = await supabase
+    console.log(`Found round ${roundData.id} for room ${roomId}, round number ${gameRoom.current_round}`);
+    console.log(`Round URLs - Real: ${roundData.real_image_url ? 'exists' : 'empty'}, Fake: ${roundData.fake_image_url ? 'exists' : 'empty'}`);
+    
+    // Check if the round has valid image URLs (they should already be populated from game start)
+    if (!roundData.real_image_url || !roundData.fake_image_url) {
+      console.error("Round found but image URLs are missing - this shouldn't happen with the new system", {
+        roundId: roundData.id,
+        realImage: roundData.real_image_url ? 'exists' : 'missing',
+        fakeImage: roundData.fake_image_url ? 'exists' : 'missing'
+      });
+      
+      return NextResponse.json({
+        success: false,
+        error: "Round images not properly initialized. Please restart the game.",
+        details: "Images should be pre-selected at game start"
+      }, { status: 500 });
+    }
+    
+    // Get the appropriate URL based on player role
+    const selectedUrl = isImpostor ? roundData.fake_image_url : roundData.real_image_url;
+    
+    // Get image details from image_titles table
+    const { data: imageDetails } = await supabase
       .from('image_titles')
-      .select('category')
-      .not('file_path', 'is', null)
-      .not('file_name', 'is', null)
-      .not('title', 'is', null);
-      
-    if (categoryError || !categories || categories.length === 0) {
-      return NextResponse.json({
-        success: false,
-        error: "Failed to fetch image categories or no images available"
-      }, {status: 404});
-    }
+      .select('title, file_name, category')
+      .eq('file_path', selectedUrl)
+      .maybeSingle();
     
-    // Get unique categories
-    const uniqueCategories = Array.from(new Set(categories.map(item => item.category)));
+    console.log(`Returning ${isImpostor ? 'fake' : 'real'} image for round ${gameRoom.current_round}`);
     
-    if (uniqueCategories.length === 0) {
-      return NextResponse.json({
-        success: false,
-        error: "No image categories available"
-      }, {status: 404});
-    }
-    
-    // Pick a random category
-    const randomCategory = uniqueCategories[Math.floor(Math.random() * uniqueCategories.length)];
-    
-    // Fetch images from this category
-    const { data: categoryImages, error: imagesError } = await supabase
-      .from('image_titles')
-      .select('id, file_path, title, file_name, category')
-      .eq('category', randomCategory)
-      .not('file_path', 'is', null)
-      .not('file_name', 'is', null)
-      .not('title', 'is', null);
-    
-    if (imagesError || !categoryImages || categoryImages.length < 2) {
-      return NextResponse.json({
-        success: false,
-        error: `Not enough images available in the selected category: ${randomCategory}`
-      }, {status: 404});
-    }
-    
-    // Shuffle the array of category images
-    const shuffledImages = [...categoryImages].sort(() => Math.random() - 0.5);
-    
-    // Select two different images from the same category
-    const realImage = shuffledImages[0];
-    const fakeImage = shuffledImages[1];
-    
-    // Determine which image to show based on player role
-    const selectedImage = isImpostor ? fakeImage : realImage;
-    
-    // Store the selected images in the game_rounds table for this round
-    const { data: currentRound, error: roundError } = await supabase
-      .from('game_rooms')
-      .select('current_round')
-      .eq('id', key)
-      .single();
-      
-    if (!roundError && currentRound && currentRound.current_round) {
-      const roundNumber = currentRound.current_round;
-      
-      // Check if a round record already exists
-      const { data: existingRound, error: checkError } = await supabase
-        .from('game_rounds')
-        .select('id')
-        .eq('room_id', key)
-        .eq('round_number', roundNumber)
-        .single();
-        
-      if (!checkError && existingRound) {
-        // Update existing round with the real and fake image URLs
-        await supabase
-          .from('game_rounds')
-          .update({ 
-            real_image_url: realImage.file_path || '',
-            fake_image_url: fakeImage.file_path || ''
-          })
-          .eq('id', existingRound.id);
-      } else {
-        // Insert new round record
-        await supabase
-          .from('game_rounds')
-          .insert([{
-            room_id: key,
-            round_number: roundNumber,
-            real_image_url: realImage.file_path || '',
-            fake_image_url: fakeImage.file_path || ''
-          }]);
-      }
-    }
-    
-    // Return the URL for the selected image based on player role
+    // Return the image data
     return NextResponse.json({
-      url: selectedImage.file_path,
-      title: selectedImage.title,
-      file_name: selectedImage.file_name,
-      category: selectedImage.category
+      url: selectedUrl,
+      title: imageDetails?.title || "Game Image",
+      file_name: imageDetails?.file_name || "image.jpg",
+      category: imageDetails?.category || "Unknown Category",
+      role: isImpostor ? "impostor" : "player"
     });
     
   } catch (error) {
-    console.error("Error in round-image-url endpoint:", error);
+    console.error("Error in round-image-url API:", error);
     return NextResponse.json({
       success: false,
-      error: "Server error processing image URL"
+      error: "Server error processing image request",
+      details: error instanceof Error ? error.message : String(error)
     }, { status: 500 });
   }
 } 

@@ -1,9 +1,10 @@
-import HeaderAuth from "@/components/header-auth";
-import ThemeSwitcher from "@/components/theme-switcher";
-import { Geist } from "next/font/google";
-import { ThemeProvider } from "next-themes";
+//import { ThemeProvider } from "next-themes";
+import { ThemeProviderWrapper } from "@/components/themeProviderWrapper";
 import { Toaster } from "sonner";
-import Link from "next/link";
+import { Geist } from "next/font/google";
+import { NavBar } from "@/components/ui/navbar";
+import { Footer } from "@/components/ui/footer";
+import { GameBackground } from "@/components/ui/background";
 import "./globals.css";
 
 const defaultUrl = process.env.VERCEL_URL
@@ -28,41 +29,24 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className={geistSans.className} suppressHydrationWarning>
-      <body className="bg-background text-foreground">
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="system"
-          enableSystem
-          disableTransitionOnChange
-        >
-          <div className="min-h-screen flex flex-col">
+      <body className="bg-background text-foreground overflow-x-hidden">
+        <ThemeProviderWrapper>
+          {/* Game Background */}
+          <GameBackground />
+          
+          <div className="min-h-screen flex flex-col overflow-hidden relative">
             {/* Navigation */}
-            <nav className="w-full flex justify-center border-b border-border h-16 bg-background">
-              <div className="w-full max-w-5xl flex justify-between items-center p-3 px-5 text-sm">
-                <div className="flex gap-5 items-center font-semibold">
-                  <Link href={"/"}>Framed</Link>
-                </div>
-                <HeaderAuth />
-              </div>
-            </nav>
+            <NavBar />
 
             {/* Main Content */}
-            <main className="flex-1 flex flex-col items-center">
-              <div className="w-full max-w-5xl px-5 py-12">
-                {children}
-              </div>
+            <main className="flex-1 flex flex-col w-full">
+              {children}
             </main>
 
             {/* Footer */}
-            <footer className="w-full border-t border-border bg-background/90">
-              <div className="max-w-5xl mx-auto px-5 py-4 flex items-center justify-between">
-                <p className="text-sm text-muted-foreground">
-                  © 2025 Framed. No rights reserved.
-                </p>
-                <ThemeSwitcher />
-              </div>
-            </footer>
+            <Footer />
           </div>
+          
           <Toaster
             richColors
             position="top-center"
@@ -73,10 +57,10 @@ export default function RootLayout({
                 border: '1px solid hsl(var(--border))',
               },
               className: 'game-toast',
-              duration: 3000,
+              duration: 2000,
             }}
           />
-        </ThemeProvider>
+        </ThemeProviderWrapper>
       </body>
     </html>
   );

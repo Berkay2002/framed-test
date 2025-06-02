@@ -99,7 +99,6 @@ export async function POST(request: NextRequest) {
     
     // First try using a regular authenticated client (which respects RLS policies)
     try {
-      console.log("Attempting to create room with authenticated client (respecting RLS)");
       const supabase = await createClient();
       
       // Generate a unique room code
@@ -117,15 +116,13 @@ export async function POST(request: NextRequest) {
       
       // Ensure the authenticated user ID matches the requested user ID
       if (user.id !== userId) {
-        console.error(`User ID mismatch: authenticated as ${user.id} but requested ${userId}`);
         return NextResponse.json({
           success: false,
           error: "User ID mismatch: You can only create rooms as yourself"
         }, { status: 403 });
       }
       
-      console.log(`Creating room "${roomName}" with host ${playerName} and code ${code}`);
-      console.log("Room data being inserted:", JSON.stringify({
+      console.log("", JSON.stringify({
         code,
         host_id: userId,
         status: "lobby", 
@@ -154,7 +151,6 @@ export async function POST(request: NextRequest) {
       console.log(`Generated alias for new player: ${gameAlias}`);
       
       // Add host as first player
-      console.log(`Adding host ${playerName} as player in room ${room.id} with alias ${gameAlias}`);
       const { data: player, error: playerError } = await supabase
         .from("game_players")
         .insert({
@@ -179,7 +175,6 @@ export async function POST(request: NextRequest) {
         throw playerError; // Will be caught and we'll try admin client as fallback
       }
       
-      console.log(`Successfully created room ${room.id} with host player ${player.id} using authenticated client`);
       return NextResponse.json({ 
         success: true, 
         room,
@@ -195,7 +190,6 @@ export async function POST(request: NextRequest) {
     let supabase;
     try {
       supabase = createAdminClient();
-      console.log("Created admin Supabase client");
     } catch (clientError) {
       console.error("Failed to create Supabase admin client:", clientError);
       return NextResponse.json({
@@ -209,15 +203,6 @@ export async function POST(request: NextRequest) {
     // Generate a unique room code
     const code = generateRoomCode();
     
-    // Create new room
-    console.log(`Creating room "${roomName}" with host ${playerName} and code ${code} using admin client`);
-    console.log("Room data being inserted:", JSON.stringify({
-      code,
-      host_id: userId,
-      status: "lobby",
-      created_at: new Date().toISOString()
-    }));
-    
     const { data: room, error: roomError } = await supabase
       .from("game_rooms")
       .insert({
@@ -230,11 +215,6 @@ export async function POST(request: NextRequest) {
       .single();
     
     if (roomError) {
-      console.error("Error creating room with admin client:", roomError);
-      console.error("Error details:", JSON.stringify(roomError));
-      console.error("Error code:", roomError.code);
-      console.error("Error message:", roomError.message);
-      console.error("Error details:", roomError.details);
       return NextResponse.json({ 
         success: false, 
         error: "Failed to create room: " + roomError.message 
@@ -242,56 +222,13 @@ export async function POST(request: NextRequest) {
     }
     
     if (!room) {
-      console.error("Room creation failed without error");
       return NextResponse.json({ 
         success: false, 
         error: "Failed to create room - no data returned" 
       }, { status: 500 });
     }
-    /*
-    // Generate game alias for the player
-    const gameAlias = generateGameAlias();
-    
-    // Add host as first player
-    console.log(`Adding host ${playerName} as player in room ${room.id} with alias ${gameAlias} using admin client`);
-    const { data: player, error: playerError } = await supabase
-      .from("game_players")
-      .insert({
-        game_alias: gameAlias,
-        user_id: userId,
-        room_id: room.id,
-        is_host: true,
-        is_online: true,
-        joined_at: new Date().toISOString(),
-        last_seen: new Date().toISOString()
-      })
-      .select("*")
-      .single();
-    
-    if (playerError) {
-      console.error("Error adding player with admin client:", playerError);
-      console.error("Player error details:", JSON.stringify(playerError));
-      
-      // Attempt to clean up the room since we couldn't add the player
-      console.log(`Cleaning up room ${room.id} due to player creation failure`);
-      await supabase.from("game_rooms").delete().eq("id", room.id);
-      
-      return NextResponse.json({ 
-        success: false, 
-        error: "Failed to add player to room: " + playerError.message 
-      }, { status: 500 });
-    }
-    
-    console.log(`Successfully created room ${room.id} with host player ${player.id} using admin client`);
-    return NextResponse.json({ 
-      success: true, 
-      room,
-      player
-    });
-    */
-    
+
   } catch (error: unknown) {
-    console.error("Error in create-room API:", error);
     return NextResponse.json({ 
       success: false, 
       error: error instanceof Error ? error.message : String(error) 

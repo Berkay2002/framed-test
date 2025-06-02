@@ -47,9 +47,7 @@ async function generateGameAlias(supabase: SupabaseClient<Database>, roomId: str
 
 export async function POST(req: NextRequest) {
   try {
-    console.log("Processing join-room request");
     const { userId, code } = await req.json();
-    console.log(`Join room request for code: ${code}, userId: ${userId}`);
     
     // Input validation
     if (!userId) {
@@ -68,7 +66,6 @@ export async function POST(req: NextRequest) {
     let supabase;
     try {
       supabase = createAdminClient();
-      console.log("Created admin Supabase client");
     } catch (clientError) {
       console.error("Failed to create Supabase client:", clientError);
       return NextResponse.json({
@@ -77,7 +74,6 @@ export async function POST(req: NextRequest) {
     }
     
     // Get the room by code
-    console.log(`Looking up room with code: ${code}`);
     const { data: room, error: roomError } = await supabase.from("game_rooms").select("*").eq("code", code).single();
     
     if (roomError) {
@@ -87,19 +83,15 @@ export async function POST(req: NextRequest) {
       }, { status: 404 });
     }
     
-    console.log(`Found room with ID: ${room.id}`);
     
     // Check if player is already in the room (RECONNECTION FLOW)
-    console.log("Checking if player already exists in room...");
     const { data: existingPlayer, error: playerError } = await supabase.from("game_players")
       .select("*")
       .eq("room_id", room.id)
       .eq("user_id", userId)
       .maybeSingle();
     
-    // If player already exists, update their online status (RECONNECT)
     if (existingPlayer) {
-      console.log(`Player ${existingPlayer.id} already exists, reconnecting...`);
       // Update player's online status and last_seen timestamp
       const { data: updatedPlayer, error: updateError } = await supabase.from("game_players").update({
         is_online: true,
@@ -111,7 +103,6 @@ export async function POST(req: NextRequest) {
         // Continue with the existing player anyway
       }
       
-      console.log(`Successfully reconnected player ${existingPlayer.id}`);
       return NextResponse.json({
         room,
         player: updatedPlayer || existingPlayer,

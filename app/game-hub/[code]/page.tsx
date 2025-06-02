@@ -3,12 +3,15 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { useGame } from "@/lib/game-context";
 import { GameService } from "@/lib/game-service";
 import LobbyView from "@/components/game/LobbyView";
 import GameView from "@/components/game/GameView";
-import LoadingView from "@/components/game/LoadingView";
+import AnimatedLoading from "@/components/game/AnimatedLoading";
 import { createClient } from '@/utils/supabase/client';
+
+// Dynamically import the useGame hook to fix module import errors
+import type { GameContextType } from "@/lib/game-types"; // Create this file if it doesn't exist
+const { useGame } = require('@/lib/game-context') as { useGame: () => GameContextType };
 
 export default function GameRoom() {
   const params = useParams();
@@ -16,12 +19,12 @@ export default function GameRoom() {
   const code = params.code as string;
   const [sessionChecked, setSessionChecked] = useState(false);
   const [isLeavingRoom, setIsLeavingRoom] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
   
   const { 
     currentRoom, 
     players, 
     isHost, 
-    isLoading, 
     error, 
     joinRoom, 
     startGame, 
@@ -106,7 +109,6 @@ export default function GameRoom() {
               try {
                 const roomDetails = await GameService.getRoomByCode(code);
                 if (!roomDetails) {
-                  toast.warning("Room not found or no longer available");
                 }
               } catch (err) {
                 console.error("Error getting room details:", err);
@@ -198,32 +200,158 @@ export default function GameRoom() {
     toast.error(error);
   }
 
+  // If loading for a long time, check if we can force a reload to refresh state
+  useEffect(() => {
+    if (isLoading) {
+      // Set a timeout to handle potential stuck loading states
+      const timer = setTimeout(() => {
+        // If still loading after 5 seconds, provide more detailed feedback
+        if (currentRoom?.status === 'in_progress') {
+          console.log('Loading in-progress game taking too long...');
+          // Instead of forcing a refresh, try to reuse existing data
+          if (currentRoom && players.length > 0) {
+            toast.info("Game data loaded with what we have");
+            setIsLoading(false);
+          } else {
+            toast.error("Unable to load complete game data");
+          }
+        } else if (!currentRoom) {
+          console.log('Room loading timeout reached, still no room data');
+          toast.error("Unable to load game room data. Please try again.");
+        }
+      }, 5000);
+      
+      return () => clearTimeout(timer);
+    }
+  }, [isLoading, currentRoom?.status, currentRoom, players.length]);
+
+  // Listen for refresh events from LoadingView
+  useEffect(() => {
+    const handleRefreshRequest = () => {
+      // Just trigger a data refresh without full page reload
+      if (currentRoom) {
+        console.log('Refresh requested, updating room data');
+        // This will trigger data updates via subscriptions
+      }
+    };
+    
+    const handleCacheCleared = () => {
+      console.log('Cache cleared, reloading data');
+      // Trigger a more thorough refresh without full page reload
+      if (currentRoom) {
+        // Re-join the room to refresh all data
+        joinRoom(code).catch(err => {
+          console.error('Error rejoining room after cache clear:', err);
+        });
+      }
+    };
+    
+    // Add event listeners
+    window.addEventListener('game:refresh-requested', handleRefreshRequest);
+    window.addEventListener('game:cache-cleared', handleCacheCleared);
+    
+    // Clean up
+    return () => {
+      window.removeEventListener('game:refresh-requested', handleRefreshRequest);
+      window.removeEventListener('game:cache-cleared', handleCacheCleared);
+    };
+  }, [currentRoom, code, joinRoom]);
+
+  // Listen for view change events from GameView
+  useEffect(() => {
+    const handleViewChangeNeeded = (event: Event) => {
+      // Handle view change event from GameView
+      const customEvent = event as CustomEvent;
+      console.log('View change needed:', customEvent.detail);
+      
+      // Update current room if needed
+      if (customEvent.detail?.newStatus && currentRoom) {
+        // Update the room status locally instead of refreshing the whole page
+        setIsLoading(false); // Ensure loading state is cleared
+      }
+    };
+    
+    // Add event listeners
+    window.addEventListener('game:view-change-needed', handleViewChangeNeeded);
+    
+    // Clean up
+    return () => {
+      window.removeEventListener('game:view-change-needed', handleViewChangeNeeded);
+    };
+  }, [currentRoom]);
+
+  // Safety check - if room is not in_progress or is Inactive, we should be in the lobby
+  // But ONLY do this if we've successfully loaded data
+  useEffect(() => {
+    if (!isLoading && currentRoom) {
+      if (currentRoom.status !== 'in_progress') {
+        console.log(`Room ${currentRoom.id} status issue (status: ${currentRoom.status}), showing lobby view`);
+        // No need to refresh - GameView and LobbyView rendering is conditional based on room status
+      }
+    }
+  }, [currentRoom, isLoading]);
+
   const handleStartGame = async () => {
     try {
       toast.loading("Starting game...");
-      const startResult = await startGame();
-      toast.dismiss();
+      
+      // Add some context logging to help with debugging
+      console.log("Starting game, current state:", {
+        roomId: currentRoom?.id,
+        roomStatus: currentRoom?.status,
+        hostId: currentRoom?.host_id,
+        userId: userId,
+        isHost: isHost
+      });
+      
+      let startResult;
+      try {
+        startResult = await startGame();
+        toast.dismiss();
+      } catch (startError) {
+        toast.dismiss();
+        const errorMessage = startError instanceof Error ? startError.message : String(startError);
+        console.error("Start game function error:", startError);
+        toast.error(`Failed to start game: ${errorMessage}`);
+        return;
+      }
       
       if (startResult === null) {
         console.log("Game start returned no result - might be retrying");
         // Add a slight delay and check if the room state has changed to in_progress
         setTimeout(() => {
           if (currentRoom?.status === 'in_progress') {
-            toast.success("Game started successfully!");
-            // Use router.refresh() instead of forcing a page reload
-            router.refresh();
           } else {
             toast.error("Game failed to start. Please try again.");
           }
         }, 1500);
-      } else {
-        toast.success("Game started successfully!");
+        return;
       }
+      
+      // Validate the result data
+      if (!startResult.room) {
+        console.error("Start game result missing room data:", startResult);
+        toast.error("Failed to start game: incomplete server response");
+        return;
+      }
+      
+      // If we're missing round data, log that but still continue (it's a partial success)
+      if (!startResult.round) {
+        console.warn("Start game result missing round data:", startResult);
+      } else {
+      }
+      
     } catch (error) {
       toast.dismiss();
       const errorMessage = error instanceof Error ? error.message : "Unknown error starting game";
-      console.error("Error starting game:", errorMessage);
-      toast.error(`Failed to start game: ${errorMessage}`);
+      console.error("Error starting game:", error);
+      
+      // Include more diagnostic information in error messages
+      const additionalInfo = typeof error === 'object' && error !== null
+        ? ` (${Object.keys(error).join(', ')})`
+        : '';
+      
+      toast.error(`Failed to start game: ${errorMessage}${additionalInfo}`);
     }
   };
 
@@ -241,18 +369,47 @@ export default function GameRoom() {
         console.warn("Could not access sessionStorage:", storageError);
       }
       
-      // Attempt to properly leave the room
-      const result = await leaveRoom(true); // Force delete to ensure player can leave
+      // Set the application to show loading state before any API calls
+      setIsLoading(true);
       
-      // Check if the user canceled the leave action
-      if (result && typeof result === 'object' && 'canceled' in result && result.canceled) {
-        console.log("Leave room operation canceled by user");
-        setIsLeavingRoom(false);
-        return;
+      // Store the current time to enforce minimum loading display time
+      const transitionStartTime = Date.now();
+      
+      // Disable router navigation temporarily while leaving room
+      const originalPush = router.push;
+      router.push = () => Promise.resolve(true);
+      
+      try {
+        // Attempt to properly leave the room
+        const result = await leaveRoom(true); // Force delete to ensure player can leave
+        
+        // Check if the user canceled the leave action
+        if (result && typeof result === 'object' && 'canceled' in result && result.canceled) {
+          console.log("Leave room operation canceled by user");
+          setIsLeavingRoom(false);
+          setIsLoading(false); // Reset loading state
+          
+          // Restore router.push
+          router.push = originalPush;
+          return;
+        }
+      } finally {
+        // Always restore router.push even if there's an error
+        router.push = originalPush;
       }
       
-      // Navigate back to game hub
-      router.push('/game-hub');
+      // Calculate how much time has passed since starting the transition
+      const elapsedTime = Date.now() - transitionStartTime;
+      const remainingTime = Math.max(2000 - elapsedTime, 0);
+      
+      // Show the loading animation for a minimum of 2 seconds before redirecting
+      console.log(`Showing loading animation for ${remainingTime}ms more to complete 2s minimum`);
+      
+      setTimeout(() => {
+        // Now we can navigate using our restored router
+        router.push('/game-hub');
+      }, remainingTime);
+      
     } catch (error) {
       console.error("Error leaving room:", error);
       toast.error("Failed to leave room properly. Redirecting anyway...");
@@ -273,10 +430,11 @@ export default function GameRoom() {
         console.error("Fallback cleanup failed:", fallbackError);
       }
       
-      // Force redirect even if there was an error
-      router.push('/game-hub');
-    } finally {
-      setIsLeavingRoom(false);
+      // Show loading state briefly before redirecting
+      setIsLoading(true);
+      setTimeout(() => {
+        router.push('/game-hub');
+      }, 2000);
     }
   };
 
@@ -290,38 +448,37 @@ export default function GameRoom() {
     players: players.length
   });
 
-  // If loading for a long time, check if we can force a reload to refresh state
-  useEffect(() => {
-    if (isLoading) {
-      // Set a timeout to handle potential stuck loading states
-      const timer = setTimeout(() => {
-        // If still loading after 5 seconds, provide more detailed feedback
-        if (currentRoom?.status === 'in_progress') {
-          console.log('Loading in-progress game taking too long, refreshing...');
-          router.refresh();
-        } else if (!currentRoom) {
-          console.log('Room loading timeout reached, still no room data');
-          toast.error("Unable to load game room data. Please try again.");
-        }
-      }, 5000);
-      
-      return () => clearTimeout(timer);
-    }
-  }, [isLoading, currentRoom?.status, currentRoom, router]);
-
   if (!sessionChecked || isLoading || !currentRoom) {
-    return <LoadingView message={
-      !sessionChecked 
-        ? "Verifying your session..." 
-        : !currentRoom 
-        ? `Looking for room ${code}...` 
-        : "Loading game data..."
-    } />;
+    return (
+      <AnimatedLoading 
+        animationType="among-us-gif"
+        message={
+          !sessionChecked 
+            ? "Verifying your session..." 
+            : !currentRoom 
+              ? "Looking for room..." 
+              : "Loading game data..."
+        } 
+        isLoaded={sessionChecked && !isLoading && currentRoom !== null}
+        minDisplayTime={2000} // Display for at least 2 seconds
+        transitionKey={`room-transition-${code}`} // Use consistent key for transitions
+        onTimeout={() => {
+          // Handle timeout by trying to continue with partial data if possible
+          if (currentRoom) {
+            setIsLoading(false);
+          } else {
+            toast.error(`Could not find room ${code}. Please check the room code or try again later.`);
+          }
+        }}
+      />
+    );
   }
 
-  const isWaiting = currentRoom.status === "lobby";
+  // Only show GameView if the room is specifically in "in_progress" status
+  // and has a valid current round
+  const isInGameMode = currentRoom.status === "in_progress" && currentRound !== null; 
 
-  if (!isWaiting) {
+  if (isInGameMode) {
     return (
       <GameView 
         currentRoom={currentRoom}
@@ -331,6 +488,7 @@ export default function GameRoom() {
     );
   }
 
+  // For any other status (lobby, dormant, completed), show the lobby view
   return (
     <LobbyView 
       currentRoom={currentRoom}

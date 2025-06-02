@@ -17,6 +17,8 @@ export async function GET(request: Request) {
   // Handle OAuth error (e.g. user canceled the sign-in)
   if (error) {
     console.error(`Auth error: ${error}`, errorDescription);
+    // Delay the redirect to show the loading animation for at least 2 seconds
+    await new Promise(resolve => setTimeout(resolve, 2000));
     return NextResponse.redirect(
       `${origin}/sign-in?error=${encodeURIComponent(errorDescription || error)}`
     );
@@ -35,11 +37,16 @@ export async function GET(request: Request) {
       
     } catch (exchangeError) {
       console.error("Failed to exchange code for session:", exchangeError);
+      // Delay the redirect to show the loading animation for at least 2 seconds
+      await new Promise(resolve => setTimeout(resolve, 2000));
       return NextResponse.redirect(
         `${origin}/sign-in?error=${encodeURIComponent("Authentication failed. Please try again.")}`
       );
     }
   }
+
+  // Delay the redirect to show the loading animation for at least 2 seconds
+  await new Promise(resolve => setTimeout(resolve, 2000));
 
   // If there's a returnUrl, redirect to it, otherwise go to game hub
   if (returnUrl && returnUrl.startsWith('/game-hub/')) {

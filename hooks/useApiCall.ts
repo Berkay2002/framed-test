@@ -64,7 +64,6 @@ export function useApiCall<T extends Record<string, any>, R = any>(
     
     try {
       // First try the API route
-      console.log(`Attempting to call ${endpoint}...`);
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: {

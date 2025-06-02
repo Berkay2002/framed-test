@@ -1,8 +1,31 @@
 import { createClient } from "@/utils/supabase/client";
 import { Database, Tables, TablesInsert } from "@/utils/supabase/types";
 import { CreateRoomResult, JoinRoomResult, StartGameResult, LeaveRoomResult } from "./shared-types";
+//import { v4 as uuidv4 } from "uuid";
+import { ChatService } from './chat-service';
 
-export type GameRoom = Tables<"game_rooms">;
+// Re-export types from database for convenience
+export type GameRoom = Tables<"game_rooms"> & {
+  // Add last_activity field used for dormant rooms
+  last_activity?: string | null;
+  // Ensure playerCount is included in the type
+  playerCount?: number;
+};
+
+// Define proper room status types
+export type RoomStatus = 'lobby' | 'in_progress' | 'completed';
+
+// Define update types
+export type RoomUpdates = Partial<{
+  name: string;
+  description: string;
+  status: RoomStatus;
+  current_round: number;
+  completed_at: string | null;
+  dormant_at: string | null;
+  impostor_id: string | null;
+}>;
+
 export type GamePlayer = Tables<"game_players">;
 export type GameRound = Tables<"game_rounds">;
 export type PlayerCaption = Tables<"player_captions">;
@@ -26,7 +49,6 @@ export class GameService {
     try {
       // Try using API route first
       try {
-        console.log("Attempting to create room via API route...");
         const response = await fetch('/api/create-room', {
           method: 'POST',
           headers: {
@@ -48,7 +70,6 @@ export class GameService {
         try {
           // Parse the JSON response
           const data = JSON.parse(responseText);
-          console.log("Successfully created room via API route");
           return data as CreateRoomResult;
         } catch (parseError) {
           console.error("Failed to parse API response:", parseError);
@@ -170,7 +191,13 @@ export class GameService {
           console.warn("Could not access localStorage:", e);
         }
         
-        console.log("Successfully created room via fallback method");
+        // Announce player joining the room
+        ChatService.sendSystemMessage(
+          room.id,
+          `${gameAlias} has joined the room.`,
+          'lobby'
+        );
+        
         return { room, player };
       }
     } catch (error) {
@@ -190,7 +217,6 @@ export class GameService {
     const supabase = createClient();
     
     try {
-      console.log(`Attempting to join room with code: ${code}`);
       
       // Try using the API route first
       try {
@@ -230,11 +256,47 @@ export class GameService {
       }
       
       if (!room) {
-        throw new Error("Room not found or no longer available");
+        //throw new Error("Room not found or no longer available");
       }
       
-      if (room.status !== "lobby") {
-        throw new Error("Cannot join a game that has already started");
+      // Handle Inactive rooms or completed games
+      if (room.status === "dormant" || room.status === "completed") {
+        console.log(`Room ${room.id} is ${room.status}, resetting...`);
+        
+        const updates: any = {
+          updated_at: new Date().toISOString()
+        };
+        
+      //   // If room is completed, reset to lobby
+      //   if (room.status === "completed") {
+      //     updates.status = "lobby";
+      //     updates.current_round = null;
+      //   }
+        
+        // If room is dormant, reactivate it to lobby
+        if (room.status === "dormant") {
+          updates.status = "lobby";
+        }
+        
+        const { data: updatedRoom, error: updateError } = await supabase
+          .from("game_rooms")
+          .update(updates)
+          .eq("id", room.id)
+          .select()
+          .single();
+        
+        if (updateError) {
+          console.error("Error resetting room:", updateError);
+          // Continue anyway, using the original room data
+        } else if (updatedRoom) {
+          console.log(`Successfully reset room ${room.id}`);
+          // Use the updated room data
+          room.status = updatedRoom.status;
+          room.current_round = updatedRoom.current_round;
+        }
+      } else if (room.status !== "lobby") {
+        // This should just be in_progress now
+        throw new Error("Cannot join a game that is already in progress");
       }
       
       // 2. Check if player is already in the room
@@ -251,6 +313,23 @@ export class GameService {
       // If player is already in the room, just return success
       if (existingPlayer) {
         console.log("Player already in room, returning existing player");
+        
+        // Make sure the player is marked as online
+        await supabase
+          .from("game_players")
+          .update({ 
+            is_online: true,
+            last_seen: new Date().toISOString()
+          })
+          .eq("id", existingPlayer.id);
+          
+        // Announce player joining the room
+        ChatService.sendSystemMessage(
+          room.id,
+          `${existingPlayer.game_alias} has rejoined the room.`,
+          'lobby'
+        );
+        
         return {
           room,
           player: existingPlayer,
@@ -273,10 +352,6 @@ export class GameService {
       // Generate a random animal-based alias if no preferred alias exists
       const animalAdjectives = ["Polite", "Honest", "Brave", "Clever", "Witty", "Swift", "Kind", "Bold"];
       const animalNames = ["Rabbit", "Fox", "Bear", "Wolf", "Eagle", "Mouse", "Tiger", "Lion"];
-
-      // const randomAdjective = animalAdjectives[Math.floor(Math.random() * animalAdjectives.length)];
-      // const randomAnimal = animalNames[Math.floor(Math.random() * animalNames.length)];
-      // const gameAlias = `${randomAdjective}${randomAnimal}`;
 
       let uniqueAlias = false;
       let randomAdjective = animalAdjectives[Math.floor(Math.random() * animalAdjectives.length)];
@@ -331,6 +406,13 @@ export class GameService {
         throw new Error("Failed to add player to room");
       }
       
+      // Announce player joining the room
+      ChatService.sendSystemMessage(
+        room.id,
+        `${gameAlias} has joined the room.`,
+        'lobby'
+      );
+      
       console.log("Successfully joined room via fallback method");
       return {
         room,
@@ -365,13 +447,69 @@ export class GameService {
         });
         
         if (response.ok) {
-          const data = await response.json();
-          console.log("Successfully started game via API route");
-          return data as StartGameResult;
+          // Parse the response with error handling
+          try {
+            const responseText = await response.text();
+            
+            // Try to parse as JSON
+            let data;
+            try {
+              data = JSON.parse(responseText);
+            } catch (parseError) {
+              console.error("Error parsing start-game response:", parseError);
+              console.error("Raw response:", responseText);
+              throw new Error("Invalid response from API: " + responseText.substring(0, 100));
+            }
+            
+            // If response doesn't have success property, or it's not true, throw an error
+            if (!data.success) {
+              throw new Error(data.error || "API returned unsuccessful response");
+            }
+            
+            console.log("Successfully started game via API route");
+            
+            // Now that the game is started, we need to fetch the room and round data
+            const { data: updatedRoom, error: roomError } = await supabase
+              .from("game_rooms")
+              .select("*")
+              .eq("id", roomId)
+              .single();
+              
+            if (roomError) {
+              throw new Error("Failed to fetch updated room after game start: " + roomError.message);
+            }
+            
+            // Get the created round
+            const { data: roundData, error: roundError } = await supabase
+              .from("game_rounds")
+              .select("*")
+              .eq("room_id", roomId)
+              .eq("round_number", 1)
+              .single();
+              
+            if (roundError) {
+              console.error("Failed to fetch round data:", roundError);
+              // Don't fail the entire operation, but return the room with null round
+              return { room: updatedRoom, round: null };
+            }
+            
+            return { room: updatedRoom, round: roundData };
+          } catch (parsingError) {
+            console.error("Error processing API response:", parsingError);
+            throw parsingError;
+          }
         }
         
         // Log the error but continue to fallback
-        console.warn("API route error in start-game, using fallback:", await response.text());
+        let errorText = "API returned status " + response.status;
+        try {
+          const errorResponse = await response.text();
+          console.warn("API route error in start-game, using fallback:", errorResponse);
+          errorText += ": " + errorResponse;
+        } catch (readError) {
+          console.warn("Failed to read error response:", readError);
+        }
+        throw new Error(errorText);
       } catch (apiError) {
         console.warn("API route failed in start-game, using fallback:", apiError);
       }
@@ -387,7 +525,7 @@ export class GameService {
       
       if (hostCheckError) {
         console.error("Host check error:", hostCheckError);
-        throw new Error("Failed to verify host status");
+        throw new Error("Failed to verify host status: " + hostCheckError.message);
       }
       
       if (!hostCheck.is_host) {
@@ -400,7 +538,6 @@ export class GameService {
         .update({
           status: "in_progress",
           current_round: 1,
-          updated_at: new Date().toISOString(),
           started_at: new Date().toISOString()
         })
         .eq("id", roomId)
@@ -409,11 +546,30 @@ export class GameService {
       
       if (roomUpdateError) {
         console.error("Room update error:", roomUpdateError);
-        throw new Error("Failed to update room status");
+        throw new Error("Failed to update room status: " + roomUpdateError.message);
       }
       
       // 3. Create the first round
-      const round = await this.createRound(roomId, 1);
+      let round;
+      try {
+        round = await this.createRound(roomId, 1);
+      } catch (roundError) {
+        console.error("Failed to create game round:", roundError);
+        // Don't fail the entire operation, but return null for the round
+        round = null;
+      }
+      
+      // Announce game start
+      try {
+        ChatService.sendSystemMessage(
+          roomId,
+          `Game started! Round 1 beginning...`,
+          'lobby'
+        );
+      } catch (error) {
+        console.error("Failed to send game start announcement:", error);
+        // Don't block the game start if the announcement fails
+      }
       
       console.log("Successfully started game via fallback method");
       return { room: updatedRoom, round };
@@ -429,65 +585,384 @@ export class GameService {
   static async createRound(roomId: string, roundNumber: number): Promise<GameRound> {
     const supabase = createClient();
     
-    // For testing purposes, using placeholder image URLs
-    // In production, you would use real and AI-generated images
-    const { data, error } = await supabase
+    console.log(`Creating round ${roundNumber} for room ${roomId}`);
+    
+    // Check if the round already exists to avoid duplicate creation
+    const { data: existingRound, error: checkError } = await supabase
       .from("game_rounds")
-      .insert({
-        room_id: roomId,
-        round_number: roundNumber,
-        real_image_url: "https://placekitten.com/500/500",
-        fake_image_url: "https://placekitten.com/500/501",
-        started_at: new Date().toISOString()
-      })
-      .select()
-      .single();
+      .select("*")
+      .eq("room_id", roomId)
+      .eq("round_number", roundNumber)
+      .maybeSingle();
     
-    if (error) throw error;
-    return data;
+    if (!checkError && existingRound) {
+      return existingRound;
+    }
+    
+    try {
+      // Select images first before creating the round
+      console.log("Selecting images for new round");
+      
+      // 1. Get categories with at least 2 images
+      console.log("Fetching categories from image_titles table...");
+      const { data: categoriesRaw, error: categoriesError } = await supabase
+        .from('image_titles')
+        .select('category, file_path')
+        .not('file_path', 'is', null)
+        .gt('file_path', '');
+      
+      if (categoriesError) {
+        console.error("Error fetching image categories:", categoriesError);
+        throw new Error(`Failed to fetch image categories: ${categoriesError.message}`);
+      }
+      
+      console.log(`Retrieved ${categoriesRaw?.length || 0} total rows from image_titles`);
+      if (categoriesRaw && categoriesRaw.length > 0) {
+        console.log("Sample file_path from first result:", categoriesRaw[0].file_path?.substring(0, 50) + "...");
+      }
+      
+      if (!categoriesRaw || categoriesRaw.length < 2) {
+        console.error("Not enough images found in database");
+        throw new Error("Not enough images found in database");
+      }
+      
+      // Count images per category
+      const categoryCount: Record<string, number> = {};
+      categoriesRaw.forEach(item => {
+        if (item.category && item.file_path) {
+          categoryCount[item.category] = (categoryCount[item.category] || 0) + 1;
+        }
+      });
+      
+      console.log("Categories with counts:", JSON.stringify(categoryCount));
+      
+      // Filter to categories with at least 2 images
+      const validCategories = Object.entries(categoryCount)
+        .filter(([_, count]) => count >= 2)
+        .map(([category]) => category);
+      
+      console.log(`Found ${validCategories.length} categories with at least 2 images:`, validCategories);
+      
+      if (validCategories.length === 0) {
+        console.error("No categories with at least 2 images found");
+        throw new Error("No categories with enough images");
+      }
+      
+      // Select a random category
+      const randomCategory = validCategories[Math.floor(Math.random() * validCategories.length)];
+      console.log(`Selected random category: ${randomCategory}`);
+      
+      // Get all images from this category
+      console.log(`Fetching images for category "${randomCategory}"...`);
+      const { data: images, error: imagesError } = await supabase
+        .from('image_titles')
+        .select('id, file_path, title, file_name, category')
+        .eq('category', randomCategory)
+        .not('file_path', 'is', null)
+        .gt('file_path', '');
+      
+      if (imagesError) {
+        console.error(`Error fetching images for category ${randomCategory}:`, imagesError);
+        throw new Error(`Error fetching images: ${imagesError.message}`);
+      }
+      
+      console.log(`Retrieved ${images?.length || 0} images for category "${randomCategory}"`);
+      if (images && images.length > 0) {
+        console.log("First few images:");
+        images.slice(0, Math.min(3, images.length)).forEach((img, i) => {
+          console.log(`  Image ${i+1}: id=${img.id}, title=${img.title || 'untitled'}, file_path=${img.file_path ? `${img.file_path.substring(0, 30)}...` : 'empty'}`);
+        });
+      }
+      
+      if (!images || images.length < 2) {
+        console.error(`Not enough images in category ${randomCategory}`);
+        throw new Error(`Not enough images in category ${randomCategory}`);
+      }
+      
+      // Shuffle and select two different images
+      const validImages = images.filter(img => img.file_path && img.file_path.trim() !== '');
+      console.log(`Found ${validImages.length} images with valid file paths out of ${images.length} total`);
+      
+      const shuffledImages = [...validImages].sort(() => Math.random() - 0.5);
+      
+      if (shuffledImages.length < 2) {
+        console.error(`Not enough valid images with file paths in category ${randomCategory}`);
+        throw new Error(`Not enough valid images in category ${randomCategory}`);
+      }
+      
+      const realImage = shuffledImages[0];
+      const fakeImage = shuffledImages[1];
+      
+      console.log("Selected real image:", {
+        id: realImage.id,
+        title: realImage.title || 'unnamed',
+        file_name: realImage.file_name,
+        file_path: realImage.file_path ? `${realImage.file_path.substring(0, 30)}...` : 'invalid'
+      });
+      
+      console.log("Selected fake image:", {
+        id: fakeImage.id,
+        title: fakeImage.title || 'unnamed',
+        file_name: fakeImage.file_name,
+        file_path: fakeImage.file_path ? `${fakeImage.file_path.substring(0, 30)}...` : 'invalid'
+      });
+      
+      // Verify we have valid URLs before proceeding
+      if (!realImage.file_path || !fakeImage.file_path) {
+        console.error("Selected images don't have valid file paths");
+        throw new Error("Selected images don't have valid file paths");
+      }
+
+      
+      const roundDuration = 20 * 1000; // 20 seconds (milliseconds) for dev
+      const deadLine = Date.now() + roundDuration;
+      
+      // Create the round with valid image URLs
+      const { data, error } = await supabase
+        .from("game_rounds")
+        .insert({
+          room_id: roomId,
+          round_number: roundNumber,
+          real_image_url: realImage.file_path,
+          fake_image_url: fakeImage.file_path,
+          started_at: new Date().toISOString(),
+          deadline_at: new Date(deadLine).toISOString(),
+        })
+        .select()
+        .maybeSingle();
+      
+      if (error) {
+        // Check if it's a duplicate key error
+        if (error.code === "23505") { // PostgreSQL duplicate key error
+          // Try fetching the round that was just created by someone else
+          console.log("Duplicate round detected, fetching the existing one");
+          const { data: retryRound } = await supabase
+            .from("game_rounds")
+            .select("*")
+            .eq("room_id", roomId)
+            .eq("round_number", roundNumber)
+            .single();
+          
+          if (!retryRound) {
+            throw new Error("Round creation failed and no existing round found");
+          }
+          return retryRound;
+        } else {
+          throw error;
+        }
+      }
+      
+      if (!data) {
+        throw new Error("Round creation returned no data");
+      }
+      
+      console.log(`Successfully created round ${roundNumber} for room ${roomId} with images`);
+      return data;
+    } catch (createError) {
+      console.error(`Failed to create round ${roundNumber}:`, createError);
+      
+      // Fallback - check if the round was created despite the error
+      const { data: retryCheck } = await supabase
+        .from("game_rounds")
+        .select("*")
+        .eq("room_id", roomId)
+        .eq("round_number", roundNumber)
+        .maybeSingle();
+        
+      if (retryCheck) {
+        console.log("Found round despite creation error, using it");
+        return retryCheck;
+      }
+      
+      throw createError;
+    }
   }
   
-  /**
-   * Submit a caption for an image
-   */
+  
+  //Submit a caption for an image
   static async submitCaption(roundId: string, playerId: string, caption: string): Promise<PlayerCaption> {
-    const supabase = createClient();
-    
-    const { data, error } = await supabase
-      .from("player_captions")
-      .insert({
-        round_id: roundId,
-        player_id: playerId,
-        caption,
-        submitted_at: new Date().toISOString()
-      })
-      .select()
-      .single();
-    
-    if (error) throw error;
-    return data;
+
+    // No longer uses direct Supabase client here, calls API instead
+    const response = await fetch('/api/caption-submit', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ roundId, playerId, captionText: caption }),
+    });
+
+    const responseData = await response.json();
+
+    if (!response.ok) {
+      // Log the detailed error from the server if available
+      console.error('API Error submitting caption:', responseData);
+      const errorMessage = responseData.error || `Failed to submit caption. Status: ${response.status}`;
+      const errorDetails = responseData.details || '';
+      throw new Error(`${errorMessage}${errorDetails ? ` Details: ${errorDetails}` : ''}`);
+    }
+
+    return responseData as PlayerCaption;
   }
-  
-  /**
-   * Submit a vote for a player
-   */
-  static async submitVote(roomId: string, voterId: string, votedForId: string): Promise<PlayerVote> {
+
+  // Submit multiple votes for a player
+static async submitMultipleVotes(roomId: string, roundId: string, voterId: string, votedForIds: string[]): Promise<PlayerVote[]> {
     const supabase = createClient();
-    
-    const { data, error } = await supabase
-      .from("player_votes")
-      .insert({
+
+    try{
+      console.log(`🗳️ VOTE SUBMISSION: Starting vote submission for voter ${voterId}`);
+      console.log(`🗳️ VOTE SUBMISSION: Room ID: ${roomId}`);
+      console.log(`🗳️ VOTE SUBMISSION: Round ID: ${roundId}`);
+      console.log(`🗳️ VOTE SUBMISSION: Voted for IDs:`, votedForIds);
+      
+      // check if you are impostor
+      const { data: room, error: roomError } = await supabase
+        .from("game_rooms")
+        .select("impostor_id")
+        .eq("id", roomId)
+        .single();
+        
+      if (roomError) {
+        console.error(`❌ VOTE SUBMISSION: Error fetching room:`, roomError);
+        throw roomError;
+      }
+      
+      console.log(`🏠 VOTE SUBMISSION: Room data fetched, impostor_id: ${room?.impostor_id}`);
+
+      //insert votes
+      const voteRecords = votedForIds.map(votedForId => ({
         room_id: roomId,
+        round_id: roundId,
         voter_id: voterId,
         voted_for_id: votedForId,
         voted_at: new Date().toISOString()
-      })
-      .select()
-      .single();
+      }));
+
+      console.log(`📝 VOTE SUBMISSION: Vote records to insert:`, voteRecords);
+
+      const {data: votesData, error: votesError } = await supabase
+        .from("player_votes")
+        .insert(voteRecords)
+        .select();
+
+      if(votesError) {
+        console.error(`❌ VOTE SUBMISSION: Error inserting votes:`, votesError);
+        throw votesError;
+      }
+      
+      console.log(`✅ VOTE SUBMISSION: Votes inserted successfully:`, votesData);
+
+      //for each player get their points
+      for(const playerId of votedForIds){
+
+        //check if impostor for extra points
+        const isImpostor = playerId === room?.impostor_id;
+
+        const pointsToAward = isImpostor ? 1 : 2; //double points for impostor
+        
+        console.log(`🎯 VOTE SUBMISSION: Awarding ${pointsToAward} points to player ${playerId} (impostor: ${isImpostor})`);
+
+        //get caption for this player in this round
+        const {data: captions, error: captionError} = await supabase
+          .from("player_captions")
+          .select("id, points")
+          .eq("player_id", playerId)
+          .eq("round_id", roundId)
+          .single();
+
+        if (captionError) {
+          console.error(`❌ VOTE SUBMISSION: Error fetching caption for player ${playerId}:`, captionError);
+          throw captionError;
+        }
+
+        if (captions) {
+          // increment current points value
+          const currentPoints = captions.points || 0;
+          console.log(`📊 VOTE SUBMISSION: Current points for player ${playerId}: ${currentPoints}`);
+          
+          const newPoints = currentPoints + pointsToAward;  
+          console.log(`📊 VOTE SUBMISSION: New points for player ${playerId}: ${newPoints}`);
+          
+          //update value supabase
+          const { error: updateError } = await supabase
+            .from("player_captions")
+            .update({ points: newPoints })
+            .eq("id", captions.id);
+            
+          if (updateError) {
+            console.error(`❌ VOTE SUBMISSION: Error updating points for player ${playerId}:`, updateError);
+            throw updateError;
+          }
+          
+          console.log(`✅ VOTE SUBMISSION: Points updated for player ${playerId}`);
+
+        } else {
+          console.warn(`⚠️ VOTE SUBMISSION: No caption found for player ${playerId} in round ${roundId}`);
+        }
+      }
+
+      console.log(`🎉 VOTE SUBMISSION: All votes and points processed successfully`);
+      return votesData || [];
+    } catch(err){
+      console.error("❌ VOTE SUBMISSION: Error submitting votes", err);
+      throw err;
+    }
+  }//mul votes func end
+
+  static async getVotingResults(roundId: string): Promise<any[]> {
+  const supabase = createClient();
+  
+  // Get the room ID from the round
+  const { data: round, error: roundError } = await supabase
+    .from("game_rounds")
+    .select("room_id")
+    .eq("id", roundId)
+    .single();
     
-    if (error) throw error;
-    return data;
-  }
+  if (roundError) throw roundError;
+  
+  // Get the room to determine impostor
+  const { data: room, error: roomError } = await supabase
+    .from("game_rooms")
+    .select("impostor_id")
+    .eq("id", round.room_id)
+    .single();
+    
+  if (roomError) throw roomError;
+  
+  // Get all captions with their points
+  const { data: captions, error: captionError } = await supabase
+    .from("player_captions")
+    .select("id, caption, player_id, points")
+    .eq("round_id", roundId);
+    
+  if (captionError) throw captionError;
+  if (!captions) return [];
+  
+  // Get player info to display names
+  const { data: players, error: playerError } = await supabase
+    .from("game_players")
+    .select("id, game_alias")
+    .eq("room_id", round.room_id);
+    
+  if (playerError) throw playerError;
+  
+  // Prepare results with player info and points
+  const results = captions.map(caption => {
+    const player = players?.find(p => p.id === caption.player_id);
+    return {
+      id: caption.id,
+      caption: caption.caption,
+      player_id: caption.player_id,
+      player_alias: player?.game_alias || "Unknown Player",
+      vote_count: Math.floor(caption.points || 0), // Estimate vote count based on points
+      points: caption.points || 0,
+      is_impostor: caption.player_id === room?.impostor_id
+    };
+  });
+  
+  // Sort by points descending
+  return results.sort((a, b) => b.points - a.points);
+}
   
   /**
    * Get active game rooms
@@ -496,65 +971,62 @@ export class GameService {
     const supabase = createClient();
     
     try {
-      // First get rooms that are in lobby status
+      console.log("Fetching active and dormant rooms from the database...");
+      
+      // Get rooms that are in lobby status or dormant status
       const { data: rooms, error } = await supabase
         .from("game_rooms")
         .select("*")
-        .eq("status", "lobby")
+        .in("status", ["lobby", "dormant"]) // Include both lobby and dormant rooms
         .order("created_at", { ascending: false });
       
-      if (error) throw error;
-      if (!rooms || rooms.length === 0) return [];
+      if (error) {
+        console.error("Error fetching rooms:", error);
+        throw error;
+      }
       
-      // For development, just return all rooms without checking player counts
-      // This prevents the constant error messages about player counting
-      return rooms;
+      if (!rooms || rooms.length === 0) {
+        console.log("No active or dormant rooms found");
+        return [];
+      }
       
-      /* Commented out for development - enable this code for production
-      // We'll use Promise.all to process rooms in parallel, but wait for all cleanups
-      const roomPromises = rooms.map(async (room) => {
-        try {
-          // Get player count for this room
-          const { count, error: countError } = await supabase
-            .from("game_players")
-            .select("*", { count: "exact", head: true })
-            .eq("room_id", room.id);
-          
-          if (countError) {
-            console.error(`Error counting players for room ${room.id}:`, countError);
-            return null; // Skip this room due to error
-          }
-          
-          // Only include rooms that have at least one player
-          if (count && count > 0) {
-            return room; // Return the room to include it
-          } else {
-            // Room has no players, clean it up
-            console.log(`Room ${room.id} has no players, cleaning up...`);
-            try {
-              // Wait for cleanup to complete
-              await this.cleanupRoomIfEmpty(room.id);
-            } catch (err) {
-              console.error(`Failed to clean up empty room ${room.id}:`, err);
+      console.log(`Found ${rooms.length} rooms: ${rooms.filter(r => r.status === "lobby").length} lobby, ${rooms.filter(r => r.status === "dormant").length} dormant`);
+      
+      // For each room, get the player count
+      const roomsWithPlayerCount = await Promise.all(
+        rooms.map(async (room) => {
+          try {
+            // Get player count for this room
+            const { count, error: countError } = await supabase
+              .from("game_players")
+              .select("*", { count: "exact", head: true })
+              .eq("room_id", room.id)
+              .eq("is_online", true);
+              
+            if (countError) {
+              console.error(`Error counting players for room ${room.id}:`, countError);
+              return { ...room, playerCount: 0 };
             }
-            // Don't include empty rooms in the results
-            return null;
+            
+            const playerCount = count || 0;
+            console.log(`Room ${room.id} (${room.code}) has ${playerCount} online players, status: ${room.status}`);
+            
+            return { 
+              ...room, 
+              playerCount
+            };
+          } catch (error) {
+            console.error(`Error processing room ${room.id}:`, error);
+            return { ...room, playerCount: 0 };
           }
-        } catch (error) {
-          console.error(`Error processing room ${room.id}:`, error);
-          return null; // Skip on error
-        }
-      });
+        })
+      );
       
-      // Wait for all room processing to complete
-      const processedRooms = await Promise.all(roomPromises);
-      
-      // Filter out nulls (rooms that were empty or had errors)
-      return processedRooms.filter((room): room is GameRoom => room !== null);
-      */
+      console.log(`Returning ${roomsWithPlayerCount.length} rooms with player counts`);
+      return roomsWithPlayerCount;
     } catch (error) {
       console.error("Error getting active rooms:", error);
-      // Return empty array instead of throwing for better UX during development
+      // Return empty array instead of throwing for better UX
       return [];
     }
   }
@@ -627,26 +1099,76 @@ export class GameService {
   static async getCurrentRound(roomId: string): Promise<GameRound | null> {
     const supabase = createClient();
     
-    // Get the current round number from the room
-    const { data: room, error: roomError } = await supabase
-      .from("game_rooms")
-      .select("current_round")
-      .eq("id", roomId)
-      .single();
-    
-    if (roomError) throw roomError;
-    if (!room.current_round) return null;
-    
-    // Get the round details
-    const { data, error } = await supabase
-      .from("game_rounds")
-      .select("*")
-      .eq("room_id", roomId)
-      .eq("round_number", room.current_round)
-      .single();
-    
-    if (error) throw error;
-    return data;
+    try {
+      console.log(`Fetching current round for room ${roomId}`);
+      
+      // Get the current round number from the room
+      const { data: room, error: roomError } = await supabase
+        .from("game_rooms")
+        .select("current_round, status")
+        .eq("id", roomId)
+        .single();
+      
+      if (roomError) {
+        console.error(`Error fetching room details for getCurrentRound: ${roomError.message}`);
+        throw new Error(`Couldn't get room details: ${roomError.message}`);
+      }
+      
+      // If room has no current round or is not in_progress, just return null
+      if (!room.current_round || room.status !== 'in_progress') {
+        console.log(`Room ${roomId} has no current round or is not in progress`);
+        return null;
+      }
+      
+      console.log(`Looking for round ${room.current_round} in room ${roomId}`);
+      
+      // Get the round details
+      const { data: roundData, error: roundError } = await supabase
+        .from("game_rounds")
+        .select("*")
+        .eq("room_id", roomId)
+        .eq("round_number", room.current_round)
+        .single();
+      
+      // If we found round data (even with empty image URLs), return it
+      // The round-image-url API will populate the image URLs when requested
+      if (!roundError && roundData) {
+        console.log(`Successfully found round data for room ${roomId}, round ${room.current_round}`);
+        return roundData;
+      }
+      
+      // If the round doesn't exist at all, create a new one
+      console.warn(`Round ${room.current_round} not found for room ${roomId}, creating it now`);
+      
+      try {
+        // Attempt to create the round
+        const { data: newRound, error: createError } = await supabase
+          .from("game_rounds")
+          .insert({
+            room_id: roomId,
+            round_number: room.current_round,
+            started_at: new Date().toISOString(),
+            real_image_url: "", // Empty placeholder that will be populated by round-image-url API
+            fake_image_url: ""  // Empty placeholder that will be populated by round-image-url API
+          })
+          .select()
+          .single();
+        
+        if (createError) {
+          console.error(`Failed to create missing round: ${createError.message}`);
+          throw new Error(`Couldn't create missing round: ${createError.message}`);
+        }
+        
+        console.log(`Successfully created missing round ${room.current_round} for room ${roomId}`);
+        return newRound;
+      } catch (createErr) {
+        console.error(`Error creating missing round: ${createErr}`);
+        throw new Error(`Failed to get or create round: ${createErr}`);
+      }
+    } catch (err) {
+      console.error(`Error in getCurrentRound for room ${roomId}:`, err);
+      throw err;
+    }
   }
   
   /**
@@ -655,6 +1177,8 @@ export class GameService {
   static subscribeToRoom(roomId: string, callback: (payload: any) => void) {
     const supabase = createClient();
     
+    console.log(`🔌 Setting up room subscription for room: ${roomId}`);
+    
     return supabase
       .channel(`room:${roomId}`)
       .on('postgres_changes', {
@@ -662,8 +1186,48 @@ export class GameService {
         schema: 'public',
         table: 'game_rooms',
         filter: `id=eq.${roomId}`
+      }, (payload) => {
+        console.log(`📡 Room subscription received payload:`, payload);
+        callback(payload);
+      })
+      .subscribe((status) => {
+        console.log(`📺 Room subscription status for ${roomId}: ${status}`);
+        
+        if (status === 'SUBSCRIBED') {
+          console.log(`✅ Successfully subscribed to room changes for ${roomId}`);
+        } else if (status === 'TIMED_OUT') {
+          console.error(`⏰ Room subscription TIMED OUT for ${roomId} - this may indicate auth/permission issues`);
+        } else if (status === 'CLOSED') {
+          console.error(`❌ Room subscription CLOSED for ${roomId}`);
+        } else {
+          console.warn(`⚠️ Room subscription status for ${roomId}: ${status}`);
+        }
+      });
+  }
+  
+  /**
+   * Set up real-time subscriptions for all game rooms
+   * @param callback Function to call when room changes are detected
+   */
+  static subscribeToAllRooms(callback: (payload: any) => void) {
+    const supabase = createClient();
+    
+    return supabase
+      .channel('all-rooms')
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'game_rooms'
       }, callback)
-      .subscribe();
+      .subscribe((status) => {
+        console.log(`All rooms subscription status: ${status}`);
+        
+        if (status === 'SUBSCRIBED') {
+          console.log('Successfully subscribed to all room changes');
+        } else {
+          console.warn(`All rooms subscription status: ${status}`);
+        }
+      });
   }
   
   /**
@@ -708,6 +1272,359 @@ export class GameService {
           }, 2000);
         }
       });
+  }
+  
+  /**
+   * Leave a game room
+   */
+  static async leaveRoom(roomId: string, userId: string, playerId: string): Promise<LeaveRoomResult> {
+    if (!roomId || !userId || !playerId) {
+      throw new Error("Room ID, User ID and Player ID are required to leave a room");
+    }
+    
+    const supabase = createClient();
+    
+    try {
+      console.log(`Player ${playerId} (user ${userId}) leaving room ${roomId}`);
+      
+      // Mark player as offline
+      const { error: updateError } = await supabase
+        .from("game_players")
+        .update({ 
+          is_online: false,
+          last_seen: new Date().toISOString() 
+        })
+        .eq("id", playerId)
+        .eq("user_id", userId);
+      
+      if (updateError) {
+        console.error("Error updating player status:", updateError);
+        throw new Error("Failed to update player status");
+      }
+      
+      // Check if the player is host and transfer host status if needed
+      const { data: player, error: playerError } = await supabase
+        .from("game_players")
+        .select("is_host")
+        .eq("id", playerId)
+        .single();
+      
+      if (playerError) {
+        console.error("Error fetching player info:", playerError);
+      } else if (player.is_host) {
+        // Find another online player in the room
+        const { data: otherPlayers, error: otherPlayersError } = await supabase
+          .from("game_players")
+          .select("*")
+          .eq("room_id", roomId)
+          .eq("is_online", true)
+          .neq("id", playerId)
+          .order("joined_at", { ascending: true })
+          .limit(1);
+        
+        if (otherPlayersError) {
+          console.error("Error finding other players:", otherPlayersError);
+        } else if (otherPlayers && otherPlayers.length > 0) {
+          const newHostPlayer = otherPlayers[0];
+          console.log(`Transferring host to player ${newHostPlayer.id}`);
+          
+          // Update the new host player
+          await supabase
+            .from("game_players")
+            .update({ is_host: true })
+            .eq("id", newHostPlayer.id);
+          
+          // Update the room host_id
+          await supabase
+            .from("game_rooms")
+            .update({ host_id: newHostPlayer.user_id })
+            .eq("id", roomId);
+        }
+      }
+      
+      // Count remaining online players in the room 
+      const { count, error: countError } = await supabase
+        .from("game_players")
+        .select("*", { count: "exact", head: true })
+        .eq("room_id", roomId)
+        .eq("is_online", true);
+      
+      if (countError) {
+        console.error("Error counting players:", countError);
+      } else {
+        const playerCount = count || 0;
+        console.log(`Room ${roomId} has ${playerCount} remaining online players`);
+        
+        // If no online players remain and room is in lobby or in_progress, mark it as dormant (inactive)
+        if (playerCount === 0) {
+          console.log(`Room ${roomId} is empty after player left, marking as dormant (inactive)`);
+          
+          const { error: roomError } = await supabase
+            .from("game_rooms")
+            .update({ 
+              status: "dormant",
+              last_activity: new Date().toISOString() 
+            })
+            .eq("id", roomId);
+          
+          if (roomError) {
+            console.error("Error updating room status:", roomError);
+          } else {
+            console.log(`Room ${roomId} marked as dormant (inactive)`);
+          }
+        }
+      }
+      
+      // Get room and player details for announcement
+      const { data: roomForAnnouncement } = await supabase
+        .from("game_rooms")
+        .select("id")
+        .eq("id", roomId)
+        .single();
+
+      const { data: playerDetails } = await supabase
+        .from("game_players")
+        .select("game_alias")
+        .eq("id", playerId)
+        .single();
+
+      // Announce player leaving
+      if (roomForAnnouncement && playerDetails) {
+        try {
+          ChatService.sendSystemMessage(
+            roomForAnnouncement.id,
+            `${playerDetails.game_alias} has left the room.`,
+            'lobby'
+          );
+        } catch (error) {
+          console.error(`Error sending leave announcement: ${error}`);
+        }
+      }
+      
+      // Check if room is now empty and should be marked as inactive
+      await this.cleanupRoomIfEmpty(roomId);
+      
+      return { 
+        success: true,
+        message: "Left room successfully" 
+      };
+    } catch (error) {
+      console.error("Error in leaveRoom:", error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Clean up a room if it's empty (has no players)
+   */
+  static async cleanupRoomIfEmpty(roomId: string): Promise<boolean> {
+    if (!roomId) {
+      console.warn("Cannot cleanup room: missing roomId");
+      return false;
+    }
+    
+    const supabase = createClient();
+    
+    try {
+      // Check if room is empty
+      const { count, error: countError } = await supabase
+        .from("game_players")
+        .select("*", { count: "exact", head: true })
+        .eq("room_id", roomId);
+      
+      if (countError) {
+        console.error(`Error counting players in room ${roomId}:`, countError);
+        return false;
+      }
+      
+      // Only clean up if there are zero players
+      if (count === 0) {
+        console.log(`Room ${roomId} is empty, cleaning up`);
+        
+        // Delete the room and all associated data
+        const deleted = await GameService.forceDeleteRoom(roomId, 'system');
+        return deleted;
+      }
+      
+      console.log(`Room ${roomId} still has ${count} players, not cleaning up`);
+      return false;
+    } catch (error) {
+      console.error(`Error in cleanupRoomIfEmpty for ${roomId}:`, error);
+      return false;
+    }
+  }
+  
+  /**
+   * Debug function to list all dormant rooms
+   */
+  static async getDormantRooms(): Promise<GameRoom[]> {
+    const supabase = createClient();
+    
+    try {
+      console.log("Fetching dormant rooms for debugging...");
+      
+      const { data: rooms, error } = await supabase
+        .from("game_rooms")
+        .select("*")
+        .eq("status", "dormant")
+        .order("created_at", { ascending: false });
+      
+      if (error) {
+        console.error("Error fetching dormant rooms:", error);
+        throw error;
+      }
+      
+      console.log(`Found ${rooms?.length || 0} dormant rooms`);
+      
+      if (rooms?.length) {
+        rooms.forEach(room => {
+          console.log(`Dormant room: ${room.id} (${room.code}), host: ${room.host_id}`);
+        });
+      }
+      
+      return rooms || [];
+    } catch (error) {
+      console.error("Error getting dormant rooms:", error);
+      return [];
+    }
+  }
+  
+  /**
+   * Get ALL game rooms without filtering by status
+   */
+  static async getAllRooms(): Promise<GameRoom[]> {
+    const supabase = createClient();
+    
+    try {
+      console.log("Fetching ALL rooms from the database without status filtering...");
+      
+      // Get all rooms without filtering by status
+      const { data: rooms, error } = await supabase
+        .from("game_rooms")
+        .select("*")
+        .order("created_at", { ascending: false });
+      
+      if (error) {
+        console.error("Error fetching all rooms:", error);
+        throw error;
+      }
+      
+      if (!rooms || rooms.length === 0) {
+        console.log("No rooms found at all");
+        return [];
+      }
+      
+      console.log(`Found ${rooms.length} total rooms with statuses:`, 
+        rooms.reduce((acc, room) => {
+          acc[room.status] = (acc[room.status] || 0) + 1;
+          return acc;
+        }, {} as Record<string, number>)
+      );
+      
+      // For each room, get the player count
+      const roomsWithPlayerCount = await Promise.all(
+        rooms.map(async (room) => {
+          try {
+            // Get player count for this room
+            const { count, error: countError } = await supabase
+              .from("game_players")
+              .select("*", { count: "exact", head: true })
+              .eq("room_id", room.id)
+              .eq("is_online", true);
+              
+            if (countError) {
+              console.error(`Error counting players for room ${room.id}:`, countError);
+              return { ...room, playerCount: 0 };
+            }
+            
+            const playerCount = count || 0;
+            console.log(`Room ${room.id} (${room.code}) has ${playerCount} online players, status: ${room.status}`);
+            
+            return { 
+              ...room, 
+              playerCount
+            };
+          } catch (error) {
+            console.error(`Error processing room ${room.id}:`, error);
+            return { ...room, playerCount: 0 };
+          }
+        })
+      );
+      
+      console.log(`Returning ${roomsWithPlayerCount.length} rooms with player counts`);
+      return roomsWithPlayerCount;
+    } catch (error) {
+      console.error("Error getting all rooms:", error);
+      // Return empty array instead of throwing for better UX
+      return [];
+    }
+  }
+  
+  /**
+   * Reactivate an inactive room by setting its status back to 'lobby'
+   */
+  static async reactivateRoom(roomId: string, userId: string): Promise<GameRoom | null> {
+    if (!roomId || !userId) {
+      console.error("Cannot reactivate room: missing roomId or userId");
+      return null;
+    }
+    
+    console.log(`Reactivating room ${roomId} for user ${userId}...`);
+    const supabase = createClient();
+    
+    try {
+      // First, check if the room exists and get the host_id
+      const { data: room, error: roomFetchError } = await supabase
+        .from("game_rooms")
+        .select("*")
+        .eq("id", roomId)
+        .single();
+        
+      if (roomFetchError) {
+        console.error("Error fetching room for reactivation:", roomFetchError);
+        return null;
+      }
+      
+      // If room doesn't exist, return null
+      if (!room) {
+        console.log(`Room ${roomId} not found for reactivation`);
+        return null;
+      }
+      
+      // Check if user is the host
+      if (room.host_id !== userId) {
+        console.error(`User ${userId} is not the host of room ${roomId}, cannot reactivate`);
+        return null;
+      }
+      
+      // If room is already in lobby status, just return it
+      if (room.status === 'lobby') {
+        console.log(`Room ${roomId} is already active (lobby)`);
+        return room;
+      }
+      
+      // Update room status to lobby
+      const { data: updatedRoom, error: updateError } = await supabase
+        .from("game_rooms")
+        .update({ 
+          status: "lobby",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", roomId)
+        .select()
+        .single();
+        
+      if (updateError) {
+        console.error("Error reactivating room:", updateError);
+        return null;
+      }
+      
+      console.log(`Successfully reactivated room ${roomId}`);
+      return updatedRoom;
+    } catch (error) {
+      console.error("Error in reactivateRoom:", error);
+      return null;
+    }
   }
   
   /**
@@ -830,199 +1747,90 @@ export class GameService {
   }
   
   /**
-   * Check if a room is empty and delete it if no players remain
+   * Force delete a room and all related data
+   * This is a permanent delete operation - use with caution!
    */
-  static async cleanupRoomIfEmpty(roomId: string): Promise<void> {
-    if (!roomId) {
-      console.error("Cannot clean up room: missing roomId");
-      return;
-    }
-    
-    console.log(`Checking if room ${roomId} is empty...`);
-    const supabase = createClient();
-    
-    try {
-      // Add a small delay before checking if a room is empty
-      // This prevents race conditions when players are joining/leaving
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      // Count players in the room
-      const { count, error: countError } = await supabase
-        .from("game_players")
-        .select("*", { count: "exact", head: true })
-        .eq("room_id", roomId);
-      
-      if (countError) {
-        console.error("Error counting players in room:", countError);
-        return;
-      }
-      
-      console.log(`Room ${roomId} has ${count} players`);
-      
-      // If no players left, attempt to delete the room
-      if (count === 0) {
-        console.log(`Room ${roomId} is empty, attempting to delete it...`);
-        
-        try {
-          // IMPORTANT: Even if we can't delete the room due to RLS policies,
-          // we should mark it as no longer active so it doesn't show up in the hub
-          const firstUpdateResult = await supabase
-            .from("game_rooms")
-            .update({ status: "completed" }) // Mark as completed instead of lobby
-            .eq("id", roomId);
-            
-          console.log(`Updated room status to completed. Now attempting deletion...`);
-          
-          // Now attempt full deletion (this might fail due to RLS)
-          const success = await this.forceDeleteRoom(roomId);
-          
-          if (success) {
-            console.log(`Successfully deleted empty room ${roomId}`);
-          } else {
-            console.error(`Failed to delete room ${roomId}, but it's now marked as completed`);
-          }
-        } catch (error) {
-          console.error(`Error in room cleanup attempt:`, error);
-        }
-      }
-    } catch (error) {
-      console.error("Error in cleanupRoomIfEmpty:", error);
-    }
-  }
-  
-  /**
-   * Clean up stale game rooms (older than the specified hours)
-   * This can be called periodically from an admin function
-   */
-  static async cleanupStaleRooms(olderThanHours: number = 24): Promise<void> {
-    const supabase = createClient();
-    
-    try {
-      // Calculate cutoff time
-      const cutoffTime = new Date();
-      cutoffTime.setHours(cutoffTime.getHours() - olderThanHours);
-      const cutoffISOString = cutoffTime.toISOString();
-      
-      // Get stale room IDs
-      const { data: staleRooms, error: queryError } = await supabase
-        .from("game_rooms")
-        .select("id")
-        .lt("created_at", cutoffISOString);
-      
-      if (queryError) {
-        console.error("Error finding stale rooms:", queryError);
-        return;
-      }
-      
-      if (!staleRooms || staleRooms.length === 0) {
-        console.log("No stale rooms found");
-        return;
-      }
-      
-      console.log(`Found ${staleRooms.length} stale rooms to clean up`);
-      
-      // Delete related data and rooms
-      for (const room of staleRooms) {
-        // Delete related data first (cascade doesn't work for all relations)
-        await supabase
-          .from("game_rounds")
-          .delete()
-          .eq("room_id", room.id);
-          
-        await supabase
-          .from("player_votes")
-          .delete()
-          .eq("room_id", room.id);
-          
-        await supabase
-          .from("game_players")
-          .delete()
-          .eq("room_id", room.id);
-        
-        // Then delete the room
-        await supabase
-          .from("game_rooms")
-          .delete()
-          .eq("id", room.id);
-      }
-      
-      console.log(`Cleaned up ${staleRooms.length} stale rooms`);
-    } catch (error) {
-      console.error("Error in cleanupStaleRooms:", error);
-    }
-  }
-  
-  /**
-   * Force delete a room and all its related data
-   * This is a more aggressive version that tries to clear everything even if foreign keys might be blocking
-   */
-  static async forceDeleteRoom(roomId: string, userId?: string): Promise<boolean> {
-    if (!roomId) {
-      console.error("Cannot delete room: missing roomId");
+  static async forceDeleteRoom(roomId: string, userId: string): Promise<boolean> {
+    if (!roomId || !userId) {
+      console.error("Cannot delete room: missing roomId or userId");
       return false;
     }
     
-    console.log(`Force deleting room ${roomId} and all related data...`);
+    console.log(`Force deleting room ${roomId} by user ${userId}`);
     const supabase = createClient();
     
     try {
-      // First, check if the room exists and get the host_id
+      // First, check if the user is the host of the room
       const { data: room, error: roomFetchError } = await supabase
         .from("game_rooms")
         .select("host_id")
         .eq("id", roomId)
-        .maybeSingle();
+        .single();
         
       if (roomFetchError) {
         console.error("Error fetching room for deletion:", roomFetchError);
         return false;
       }
       
-      // If room doesn't exist, consider the deletion successful
       if (!room) {
-        console.log(`Room ${roomId} not found, considering deletion successful`);
-        return true;
+        console.log(`Room ${roomId} not found for deletion`);
+        return false;
       }
       
-      // Check if we need to respect the host-only policy
-      if (userId && room.host_id !== userId) {
+      // Check if user is the host or has admin privileges
+      if (room.host_id !== userId) {
         console.error(`User ${userId} is not the host of room ${roomId}, cannot delete`);
         return false;
       }
       
-      // 1. Get all round IDs for this room (needed for caption deletion)
-      const { data: rounds, error: roundsError } = await supabase
-        .from("game_rounds")
-        .select("id")
+      // Delete all player records first (due to foreign key constraints)
+      const { error: playersDeleteError } = await supabase
+        .from("game_players")
+        .delete()
         .eq("room_id", roomId);
         
-      if (roundsError) {
-        console.error("Error fetching rounds for deletion:", roundsError);
-        // Continue anyway
+      if (playersDeleteError) {
+        console.error("Error deleting players:", playersDeleteError);
+        // Continue anyway - we want to try to delete as much as possible
       }
       
-      const roundIds = rounds?.map(r => r.id) || [];
-      console.log(`Found ${roundIds.length} rounds to clean up`);
-      
-      // 2. Delete player captions first using the round IDs
-      if (roundIds.length > 0) {
-        for (const roundId of roundIds) {
-          try {
+      // Delete all rounds in the room
+      try {
+        const { data: rounds, error: roundsError } = await supabase
+          .from("game_rounds")
+          .select("id")
+          .eq("room_id", roomId);
+          
+        if (roundsError) {
+          console.error("Error fetching rounds:", roundsError);
+        } else if (rounds && rounds.length > 0) {
+          // Delete captions for all rounds
+          for (const round of rounds) {
             const { error: captionsError } = await supabase
               .from("player_captions")
               .delete()
-              .eq("round_id", roundId);
+              .eq("round_id", round.id);
               
             if (captionsError) {
-              console.error(`Error deleting captions for round ${roundId}:`, captionsError);
+              console.error(`Error deleting captions for round ${round.id}:`, captionsError);
             }
-          } catch (err) {
-            console.error(`Error in caption deletion for round ${roundId}:`, err);
+          }
+          
+          // Now delete the rounds
+          const { error: roundsDeleteError } = await supabase
+            .from("game_rounds")
+            .delete()
+            .eq("room_id", roomId);
+            
+          if (roundsDeleteError) {
+            console.error("Error deleting rounds:", roundsDeleteError);
           }
         }
+      } catch (roundsError) {
+        console.error("Error handling rounds deletion:", roundsError);
       }
       
-      // 3. Delete all player votes for this room
+      // Delete votes
       try {
         const { error: votesError } = await supabase
           .from("player_votes")
@@ -1031,64 +1839,25 @@ export class GameService {
           
         if (votesError) {
           console.error("Error deleting votes:", votesError);
-        } else {
-          console.log("Successfully deleted votes");
         }
-      } catch (err) {
-        console.error("Error in votes deletion:", err);
+      } catch (votesError) {
+        console.error("Error deleting votes (caught):", votesError);
       }
       
-      // 4. Delete all players for this room
-      try {
-        const { error: playersError } = await supabase
-          .from("game_players")
-          .delete()
-          .eq("room_id", roomId);
-          
-        if (playersError) {
-          console.error("Error deleting players:", playersError);
-        } else {
-          console.log("Successfully deleted players");
-        }
-      } catch (err) {
-        console.error("Error in player deletion:", err);
-      }
-      
-      // 5. Delete all rounds for this room
-      try {
-        const { error: roundsDeleteError } = await supabase
-          .from("game_rounds")
-          .delete()
-          .eq("room_id", roomId);
-          
-        if (roundsDeleteError) {
-          console.error("Error deleting rounds:", roundsDeleteError);
-        } else {
-          console.log("Successfully deleted rounds");
-        }
-      } catch (err) {
-        console.error("Error in rounds deletion:", err);
-      }
-      
-      // 6. Finally, delete the room itself
-      try {
-        const { error: roomError } = await supabase
-          .from("game_rooms")
-          .delete()
-          .eq("id", roomId);
-          
-        if (roomError) {
-          console.error("Error deleting room:", roomError);
-          console.error("Full error details:", JSON.stringify(roomError));
-          return false;
-        } else {
-          console.log(`Successfully deleted room ${roomId}`);
-          return true;
-        }
-      } catch (err) {
-        console.error("Error in room deletion:", err);
+      // Finally, delete the room itself
+      const { error: roomDeleteError } = await supabase
+        .from("game_rooms")
+        .delete()
+        .eq("id", roomId)
+        .eq("host_id", userId); // Extra safety check
+        
+      if (roomDeleteError) {
+        console.error("Error deleting room:", roomDeleteError);
         return false;
       }
+      
+      console.log(`Successfully deleted room ${roomId}`);
+      return true;
     } catch (error) {
       console.error("Error in forceDeleteRoom:", error);
       return false;
@@ -1096,185 +1865,262 @@ export class GameService {
   }
   
   /**
-   * Update a player's heartbeat to mark them as active
+   * Clean up stale rooms that haven't been active for a specific number of hours
+   * This is an admin function and will delete rooms and all related data
    */
-  static async updatePlayerHeartbeat(playerId: string, userId: string): Promise<void> {
-    if (!playerId || !userId) {
-      throw new Error("Player ID and User ID are required");
+  static async cleanupStaleRooms(hours: number = 24): Promise<number> {
+    if (hours < 1) {
+      console.error("Hours must be at least 1");
+      return 0;
     }
     
-    try {
-      // Try using API route first
-      try {
-        const response = await fetch('/api/player-heartbeat', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ playerId, userId })
-        });
-        
-        if (response.ok) {
-          // Success, nothing else needed
-          return;
-        }
-        
-        // Log the error but continue to fallback
-        console.warn("API route error in player-heartbeat, using fallback:", await response.text());
-      } catch (apiError) {
-        console.warn("API route failed in player-heartbeat, using fallback:", apiError);
-      }
-      
-      // FALLBACK: Direct implementation
-      console.log("Using fallback method for player heartbeat");
-      
-      const supabase = createClient();
-      
-      // Update the player's online status and last_seen timestamp
-      await supabase
-        .from("game_players")
-        .update({
-          is_online: true,
-          last_seen: new Date().toISOString()
-        })
-        .eq("id", playerId)
-        .eq("user_id", userId);
-        
-    } catch (error) {
-      console.error("Error updating player heartbeat:", error);
-      // Don't throw an error since heartbeat failures shouldn't break the UI
-    }
-  }
-  
-  /**
-   * Clean up rooms with stale heartbeats
-   * @param staleMinutes Number of minutes without a heartbeat to consider a room stale
-   * @returns Promise resolving to the number of rooms cleaned up
-   */
-  static async cleanupStaleHeartbeats(staleMinutes: number = 5): Promise<number> {
+    console.log(`Cleaning up rooms inactive for ${hours}+ hours`);
     const supabase = createClient();
+    let cleanedCount = 0;
     
     try {
-      // Calculate cutoff time
+      // Calculate the cutoff time
       const cutoffTime = new Date();
-      cutoffTime.setMinutes(cutoffTime.getMinutes() - staleMinutes);
-      const cutoffISOString = cutoffTime.toISOString();
+      cutoffTime.setHours(cutoffTime.getHours() - hours);
+      const cutoffTimeString = cutoffTime.toISOString();
       
-      // Get stale rooms based on heartbeat
-      const { data: staleRooms, error: queryError } = await supabase
+      // Find rooms with last activity older than the cutoff
+      const { data: staleRooms, error: roomsError } = await supabase
         .from("game_rooms")
-        .select("id")
-        .lt("last_heartbeat", cutoffISOString)
-        .eq("status", "lobby"); // Only cleanup lobby rooms, not in-progress or completed
+        .select("*")
+        .lt("last_activity", cutoffTimeString);
       
-      if (queryError) {
-        console.error("Error finding stale heartbeat rooms:", queryError);
+      if (roomsError) {
+        console.error("Error finding stale rooms:", roomsError);
         return 0;
       }
       
       if (!staleRooms || staleRooms.length === 0) {
-        console.log("No stale heartbeat rooms found");
+        console.log("No stale rooms found");
         return 0;
       }
       
-      console.log(`Found ${staleRooms.length} rooms with stale heartbeats to clean up`);
+      console.log(`Found ${staleRooms.length} stale rooms to clean up`);
       
       // Process each stale room
-      let cleanedCount = 0;
       for (const room of staleRooms) {
         try {
-          // Mark room as completed
-          const { error: updateError } = await supabase
-            .from("game_rooms")
-            .update({ status: "completed" })
-            .eq("id", room.id);
-          
-          if (updateError) {
-            console.error(`Error updating stale room ${room.id} status:`, updateError);
-            continue;
-          }
-          
-          // Try to fully delete the room
-          const success = await this.forceDeleteRoom(room.id);
+          // Attempt to delete the room using our force delete method
+          const success = await this.forceDeleteRoom(room.id, room.host_id);
           
           if (success) {
-            console.log(`Successfully deleted stale heartbeat room ${room.id}`);
             cleanedCount++;
+            console.log(`Successfully deleted stale room ${room.id} (${room.code})`);
           } else {
-            console.error(`Failed to delete stale heartbeat room ${room.id}, but it's now marked as completed`);
+            console.error(`Failed to delete stale room ${room.id} (${room.code})`);
           }
-        } catch (error) {
-          console.error(`Error cleaning up stale heartbeat room ${room.id}:`, error);
+        } catch (roomError) {
+          console.error(`Error processing stale room ${room.id}:`, roomError);
         }
       }
       
+      console.log(`Stale room cleanup completed: ${cleanedCount}/${staleRooms.length} rooms deleted`);
       return cleanedCount;
     } catch (error) {
-      console.error("Error in cleanupStaleHeartbeats:", error);
-      return 0;
+      console.error("Error in cleanupStaleRooms:", error);
+      throw error;
     }
   }
   
-  /**
-   * Update room's heartbeat timestamp to keep it active
-   * @param roomId The ID of the room to update
-   * @returns Promise resolving to the updated room or null if update failed
-   */
-  static async updateRoomHeartbeat(roomId: string): Promise<GameRoom | null> {
-    if (!roomId) {
-      console.warn("Cannot update room heartbeat: missing roomId");
-      return null;
-    }
+  //Get captions for a specific round
+  static async getRoundCaptions(roundId: string): Promise<PlayerCaption[]> {
+    const supabase = createClient();
     
-    console.log(`Updating heartbeat for room ${roomId}`);
+    const { data, error } = await supabase
+      .from("player_captions")
+      .select("id, caption, round_id, player_id, submitted_at, peep_target_id, points")
+      .eq("round_id", roundId);
+      
+    if (error) throw error;
+    return data || [];
+  }
+
+  // Get round results with vote counts
+  static async getRoundResults(roundId: string): Promise<{
+    winner: {
+      playerId: string;
+      playerAlias: string;
+      caption: string;
+      voteCount: number;
+    } | null;
+    results: Array<{
+      playerId: string;
+      playerAlias: string;
+      caption: string;
+      voteCount: number;
+    }>;
+    totalVotes: number;
+  }> {
     const supabase = createClient();
     
     try {
-      // Update the room's last_heartbeat timestamp
-      const { data, error } = await supabase
-        .from("game_rooms")
-        .update({ 
-          last_heartbeat: new Date().toISOString() 
-        })
-        .eq("id", roomId)
-        .select()
+      console.log(`Getting round results for round ${roundId}`);
+      
+      // Get all captions for this round
+      const { data: captions, error: captionsError } = await supabase
+        .from("player_captions")
+        .select("id, caption, player_id")
+        .eq("round_id", roundId);
+      
+      if (captionsError) {
+        console.error("Error fetching captions:", captionsError);
+        throw new Error(`Failed to fetch captions: ${captionsError.message}`);
+      }
+      
+      if (!captions || captions.length === 0) {
+        console.log("No captions found for this round");
+        return {
+          winner: null,
+          results: [],
+          totalVotes: 0
+        };
+      }
+      
+      console.log(`Found ${captions.length} captions for round ${roundId}`);
+      
+      // Get player info for all players who submitted captions
+      const playerIds = Array.from(new Set(captions.map(c => c.player_id) || []));
+      const { data: players, error: playersError } = await supabase
+        .from("game_players")
+        .select("id, game_alias")
+        .in("id", playerIds);
+      
+      if (playersError) {
+        console.error("Error fetching players:", playersError);
+        throw new Error(`Failed to fetch players: ${playersError.message}`);
+      }
+      
+      // Create a map of player ID to alias for quick lookup
+      const playerMap = new Map(players?.map(p => [p.id, p.game_alias]) || []);
+      
+      // Get the round info to find the room_id
+      const { data: roundInfo, error: roundInfoError } = await supabase
+        .from("game_rounds")
+        .select("room_id")
+        .eq("id", roundId)
         .single();
       
-      if (error) {
-        console.error(`Error updating room heartbeat for ${roomId}:`, error);
-        return null;
+      if (roundInfoError || !roundInfo) {
+        console.error("Error fetching round info:", roundInfoError);
+        throw new Error(`Failed to fetch round info: ${roundInfoError?.message}`);
       }
       
-      return data;
-    } catch (error) {
-      console.error(`Error in updateRoomHeartbeat for ${roomId}:`, error);
-      return null;
-    }
-  }
-  
-  /**
-   * Trigger the room heartbeat check, which will clean up empty and inactive rooms
-   * This can be called periodically from a client or admin interface
-   */
-  static async triggerRoomHeartbeat(): Promise<boolean> {
-    try {
-      console.log("Triggering room heartbeat check");
-      const response = await fetch('/api/room-heartbeat', {
-        method: 'GET'
+      // Get all votes for players in this round, filtered by room_id to ensure we only get votes from this game
+      const { data: votes, error: votesError } = await supabase
+        .from("player_votes")
+        .select("voted_for_id")
+        .eq("room_id", roundInfo.room_id)
+        .in("voted_for_id", playerIds);
+      
+      if (votesError) {
+        console.error("Error fetching votes:", votesError);
+        throw new Error(`Failed to fetch votes: ${votesError.message}`);
+      }
+      
+      console.log(`Found ${votes?.length || 0} votes for this round`);
+      
+      // Count votes for each player
+      const voteCounts: Record<string, number> = {};
+      votes?.forEach(vote => {
+        voteCounts[vote.voted_for_id] = (voteCounts[vote.voted_for_id] || 0) + 1;
       });
       
-      if (!response.ok) {
-        console.error(`Room heartbeat check failed: ${response.status} ${response.statusText}`);
-        return false;
-      }
+      console.log("Vote counts:", voteCounts);
       
-      const result = await response.json();
-      console.log("Room heartbeat check result:", result);
+      // Create results array
+      const results = captions.map(caption => ({
+        playerId: caption.player_id,
+        playerAlias: playerMap.get(caption.player_id) || "Unknown Player",
+        caption: caption.caption || "",
+        voteCount: voteCounts[caption.player_id] || 0
+      }));
       
-      return result.success;
+      // Sort by vote count (descending) to find winner
+      results.sort((a, b) => b.voteCount - a.voteCount);
+      
+      const winner = results.length > 0 ? results[0] : null;
+      const totalVotes = votes?.length || 0;
+      
+      console.log(`Round results calculated: ${results.length} players, winner: ${winner?.playerAlias || 'none'} with ${winner?.voteCount || 0} votes`);
+      
+      return {
+        winner,
+        results,
+        totalVotes
+      };
     } catch (error) {
-      console.error("Error triggering room heartbeat:", error);
-      return false;
+      console.error("Error in getRoundResults:", error);
+      throw error;
     }
   }
-} 
+
+  // Get all game results for a room (optimized for final results)
+  static async getAllGameResults(roomId: string): Promise<Array<{
+    roundNumber: number;
+    roundId: string;
+    results: Array<{
+      playerId: string;
+      playerAlias: string;
+      caption: string;
+      voteCount: number;
+    }>;
+  }>> {
+    const supabase = createClient();
+    
+    try {
+      console.log(`Getting all game results for room ${roomId}`);
+      
+      // Get all rounds for this room
+      const { data: rounds, error: roundsError } = await supabase
+        .from('game_rounds')
+        .select('id, round_number')
+        .eq('room_id', roomId)
+        .order('round_number', { ascending: true });
+
+      if (roundsError) {
+        throw new Error(`Failed to fetch rounds: ${roundsError.message}`);
+      }
+
+      if (!rounds || rounds.length === 0) {
+        console.log("No rounds found for this room");
+        return [];
+      }
+
+      console.log(`Found ${rounds.length} rounds for room ${roomId}`);
+
+      // Get results for each round individually to ensure proper vote counting per round
+      const gameResults = [];
+      
+      for (const round of rounds) {
+        try {
+          const roundResults = await this.getRoundResults(round.id);
+          gameResults.push({
+            roundNumber: round.round_number,
+            roundId: round.id,
+            results: roundResults.results
+          });
+        } catch (error) {
+          console.error(`Error getting results for round ${round.round_number}:`, error);
+          // Continue with other rounds even if one fails
+          gameResults.push({
+            roundNumber: round.round_number,
+            roundId: round.id,
+            results: []
+          });
+        }
+      }
+
+      console.log(`Calculated results for ${gameResults.length} rounds`);
+      return gameResults;
+
+    } catch (error) {
+      console.error("Error in getAllGameResults:", error);
+      throw error;
+    }
+  }
+}

@@ -14,7 +14,7 @@ export type JoinRoomResult = {
 
 export type StartGameResult = { 
   room: GameRoom;
-  round: GameRound;
+  round: GameRound | null;
 };
 
 export type LeaveRoomResult = {

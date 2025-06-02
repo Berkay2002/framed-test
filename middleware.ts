@@ -1,5 +1,56 @@
+import { createServerClient, type CookieOptions } from '@supabase/ssr';
 import { type NextRequest, NextResponse } from "next/server";
-import { updateSession, createClient } from "@/utils/supabase/middleware";
+import type { Database } from './utils/supabase/types';
+
+// Create a Supabase client for middleware
+export const createClient = (request: NextRequest) => {
+  // Create an unmodified response
+  let response = NextResponse.next();
+
+  const supabase = createServerClient<Database>(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        get(name: string) {
+          return request.cookies.get(name)?.value;
+        },
+        set(name: string, value: string, options: CookieOptions) {
+          // If the cookie is updated, update the cookies for the request and response
+          request.cookies.set(name, value, options);
+          response = NextResponse.next();
+          response.cookies.set(name, value, options);
+        },
+        remove(name: string, options: CookieOptions) {
+          // If the cookie is removed, update the cookies for the request and response
+          request.cookies.set(name, '', options);
+          response = NextResponse.next();
+          response.cookies.set(name, '', options);
+        }
+      }
+    }
+  );
+
+  return { supabase, response };
+};
+
+// Update the Supabase session
+const updateSession = async (request: NextRequest) => {
+  try {
+    const { supabase, response } = createClient(request);
+
+    // This will refresh session if expired - required for Server Components
+    // https://supabase.com/docs/guides/auth/server-side/nextjs
+    await supabase.auth.getUser();
+
+    return response;
+  } catch (e) {
+    // If you are here, a Supabase client could not be created!
+    // This is likely because you have not set up environment variables.
+    console.error('Error updating Supabase session:', e);
+    return NextResponse.next();
+  }
+};
 
 export async function middleware(request: NextRequest) {
   // Always update the auth session

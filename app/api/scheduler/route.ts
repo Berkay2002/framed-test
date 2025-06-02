@@ -14,8 +14,18 @@ export async function GET(request: NextRequest) {
     // Check if request is from Vercel Cron
     const isVercelCron = request.headers.get('x-vercel-cron') === '1';
     
-    // If not from Vercel Cron, verify API key
-    if (!isVercelCron) {
+    if (isVercelCron) {
+      // Verify Vercel cron authorization header
+      if (request.headers.get('Authorization') !== `Bearer ${process.env.CRON_SECRET}`) {
+        console.warn("Invalid CRON_SECRET for Vercel cron job");
+        return NextResponse.json({
+          success: false,
+          message: "Unauthorized"
+        }, { status: 401 });
+      }
+      console.log("Request from Vercel Cron detected - authorized");
+    } else {
+      // If not from Vercel Cron, verify API key
       const apiKey = request.headers.get('x-api-key');
       const schedulerKey = process.env.SCHEDULER_API_KEY;
       
@@ -27,8 +37,6 @@ export async function GET(request: NextRequest) {
           message: "Unauthorized"
         }, { status: 401 });
       }
-    } else {
-      console.log("Request from Vercel Cron detected - authorized");
     }
     
     // Run all scheduled jobs
