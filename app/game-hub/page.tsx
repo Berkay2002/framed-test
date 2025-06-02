@@ -90,7 +90,7 @@ export default function GameHub() {
   const myInactiveRoomsCount = userId 
     ? activeRooms.filter(room => 
         room.host_id === userId && 
-        (room.heartbeat_status === 'Inactive' || room.playerCount === 0)
+        room.playerCount === 0 // Only check playerCount
       ).length 
     : 0;
     
@@ -193,10 +193,9 @@ export default function GameHub() {
     
     if (activeFilter === 'active') {
       // For "Available Games" view, show all active rooms regardless of ownership
-      console.log('Filtering active view rooms...');
       const availableRooms = activeRooms.filter(room => 
         (room.status === 'lobby' || room.status === 'in_progress') &&
-        (room.heartbeat_status === 'Active' || room.playerCount > 0)
+        room.playerCount > 0 // Only check playerCount
       );
       console.log(`Showing ${availableRooms.length} available rooms`);
       setFilteredRooms(availableRooms);
@@ -205,7 +204,7 @@ export default function GameHub() {
       const myRooms = activeRooms.filter(room => room.host_id === userId);
       console.log('My rooms (all statuses):', myRooms);
       console.log('My empty/inactive rooms count:', myRooms.filter(room => 
-        room.playerCount === 0 || room.heartbeat_status === 'Inactive' || room.status === 'completed'
+        room.playerCount === 0 || room.status === 'completed'
       ).length);
       setFilteredRooms(myRooms);
     }
@@ -384,7 +383,6 @@ export default function GameHub() {
 
   // Get status badge for a room
   const getStatusBadge = (room: RoomWithPlayerCount) => {
-    // Owner badge (show regardless of status)
     if (room.host_id === userId) {
       return (
         <Badge variant="outline" className="bg-primary/10 text-primary border-primary/50 font-medium">
@@ -392,26 +390,6 @@ export default function GameHub() {
         </Badge>
       );
     }
-    
-    // Status badges
-    if (room.heartbeat_status === 'Inactive') {
-      return (
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Badge variant="outline" className="bg-amber-500/10 text-amber-500 border-amber-500/50 font-medium">
-                <AlertCircle className="w-3 h-3 mr-1" />
-                Inactive
-              </Badge>
-            </TooltipTrigger>
-            <TooltipContent>
-              <p>This room is inactive but will become active when you join</p>
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-      );
-    }
-    
     if (room.status === 'in_progress') {
       return (
         <TooltipProvider>
@@ -428,7 +406,6 @@ export default function GameHub() {
         </TooltipProvider>
       );
     }
-    
     // Active room (lobby status)
     return (
       <TooltipProvider>
@@ -449,7 +426,6 @@ export default function GameHub() {
   // Get friendly status text for display
   const getStatusText = (room: RoomWithPlayerCount) => {
     if (room.status === 'in_progress') return 'In progress';
-    if (room.heartbeat_status === 'Inactive') return 'Inactive';
     if (room.status === 'completed') return 'Game ended';
     if (room.playerCount === 0) return 'Empty';
     return 'Active - Waiting for players';
@@ -836,7 +812,7 @@ function RoomCard({
   onShowQrCode: (code: string) => void;
 }) {
   const isOwner = room.host_id === userId;
-  const isInactive = room.heartbeat_status === 'Inactive';
+  const isInactive = room.playerCount === 0;
   
   return (
     <Card className={`responsive-card transition-all duration-200 hover:shadow-md
